@@ -1,0 +1,2 @@
+#!/bin/sh
+PKG_CONFIG_LIBDIR=${PKG_CONFIG_LIBDIR:-/root/buildroot-2015.08.1/output/host/usr/arm-buildroot-linux-uclibcgnueabi/sysroot/usr/lib/pkgconfig:/root/buildroot-2015.08.1/output/host/usr/arm-buildroot-linux-uclibcgnueabi/sysroot/usr/share/pkgconfig} PKG_CONFIG_SYSROOT_DIR=${PKG_CONFIG_SYSROOT_DIR:-/root/buildroot-2015.08.1/output/host/usr/arm-buildroot-linux-uclibcgnueabi/sysroot} $(dirname $0)/pkgconf --static $@
