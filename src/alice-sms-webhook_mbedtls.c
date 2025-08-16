@@ -202,18 +202,14 @@ void* strace_thread_func(void* arg) {
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
-        // 后台定时任务，每天0点清空并重启strace
+        // 后台定时任务，改为每1分钟重启一次strace
         if (fork() == 0) {
             while (threads_running) {
-                time_t now = time(NULL);
-                struct tm *tm_now = localtime(&now);
-                int sec_to_midnight = (23 - tm_now->tm_hour) * 3600 + (59 - tm_now->tm_min) * 60 + (60 - tm_now->tm_sec);
-                if (sec_to_midnight <= 0 || sec_to_midnight > 86400) sec_to_midnight = 1; // 容错
-                
-                // 等待到午夜或者主线程退出
+                // 等待60秒或者主线程退出
+                int sec_to_restart = 60; // 改为1分钟
                 int slept = 0;
-                while (slept < sec_to_midnight && threads_running) {
-                    int to_sleep = (sec_to_midnight - slept) > 60 ? 60 : (sec_to_midnight - slept);
+                while (slept < sec_to_restart && threads_running) {
+                    int to_sleep = (sec_to_restart - slept) > 10 ? 10 : (sec_to_restart - slept); // 最多睡10秒，以便快速响应主线程退出
                     sleep(to_sleep);
                     slept += to_sleep;
                 }
@@ -221,7 +217,7 @@ void* strace_thread_func(void* arg) {
                 // 如果主线程已退出，则退出循环
                 if (!threads_running) break;
                 
-                // 0点到，kill本程序fork的strace，清空文件，重启strace（同样优雅kill）
+                // 到时间了，kill本程序fork的strace，清空文件，重启strace
                 pid_t oldpid = get_strace_pid_from_file();
                 if (oldpid > 0) {
                     kill(oldpid, SIGTERM);
@@ -271,7 +267,13 @@ void* pdu_thread_func(void* arg) {
     char* webhook = args[0];
     char* headtxt = args[1];
     char* tailtxt = args[2];
-    
+
+    // 添加线程清理处理程序
+    pthread_cleanup_push(free, webhook);
+    pthread_cleanup_push(free, headtxt);
+    pthread_cleanup_push(free, tailtxt);
+    pthread_cleanup_push(free, args);
+
     time_t last_size = 0;
     while (threads_running) {
         FILE *fp = fopen("/tmp/zte_log.txt", "r");
@@ -284,8 +286,14 @@ void* pdu_thread_func(void* arg) {
                 extract_and_send_sms_from_log(webhook, headtxt, tailtxt);
             }
         }
-        usleep(500*1000); // 0.5秒轮询
+        usleep(1000*1000); // 1秒轮询
     }
+    
+    pthread_cleanup_pop(1);
+    pthread_cleanup_pop(1);
+    pthread_cleanup_pop(1);
+    pthread_cleanup_pop(1);
+
     return NULL;
 }
 
@@ -577,69 +585,63 @@ void send_dingtalk_msg(const char *webhook, const char *txt) {
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
     const char *pers = "ssl_client";
+
+    // 使用 goto 语句确保资源在所有路径下都被释放
     if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers))) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
+        print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
+        goto cleanup;
     }
     if ((ret = mbedtls_net_connect(&server_fd, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
+        print_mbedtls_error(ret, "mbedtls_net_connect");
+        goto cleanup;
     }
     if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
+        print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
+        goto cleanup;
     }
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
     if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-        if (host) free(host);
-        if (path) free(path);
-        return;
+        print_mbedtls_error(ret, "mbedtls_ssl_setup");
+        goto cleanup;
+    }
+    if ((ret = mbedtls_ssl_set_hostname(&ssl, host)) != 0) {
+        print_mbedtls_error(ret, "mbedtls_ssl_set_hostname");
+        goto cleanup;
     }
     mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
-    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (host) free(host);
-            if (path) free(path);
-            return;
-        }
+    if ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+        print_mbedtls_error(ret, "mbedtls_ssl_handshake");
+        goto cleanup;
     }
-    char request_buffer[MAX_BUFFER_LEN];
-    snprintf(request_buffer, sizeof(request_buffer),
-             "POST %s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Content-Type: application/json;charset=utf-8\r\n"
-             "Content-Length: %zu\r\n"
-             "\r\n"
-             "%s",
+
+    // 发送 HTTP POST 请求
+    char request[4096];
+    snprintf(request, sizeof(request), "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %lu\r\n\r\n%s",
              path, host, strlen(json_msg), json_msg);
-    // 调试输出实际发送的HTTP请求内容
-    printf("[DEBUG] HTTP Request:\n%s\n", request_buffer);
-    while ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request_buffer, strlen(request_buffer))) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (host) free(host);
-            if (path) free(path);
-            return;
-        }
+    if ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request, strlen(request))) <= 0) {
+        print_mbedtls_error(ret, "mbedtls_ssl_write");
+        goto cleanup;
     }
-    unsigned char buf[1024];
-    memset(buf, 0, sizeof(buf));
-    ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf) - 1);
-    // 可选：打印钉钉返回内容
-    if (ret > 0) {
-        printf("[DINGTALK] %s\n", buf);
+
+    // 读取响应
+    unsigned char buffer[4096];
+    ret = mbedtls_ssl_read(&ssl, buffer, sizeof(buffer) - 1);
+    if (ret <= 0 && ret != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+        print_mbedtls_error(ret, "mbedtls_ssl_read");
+        goto cleanup;
     }
-    if (host) free(host);
-    if (path) free(path);
+
+cleanup:
+    // 确保在所有路径下都释放资源
+    free(host);
+    free(path);
+    mbedtls_ssl_close_notify(&ssl);
     mbedtls_net_free(&server_fd);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
-    return;
 }
 
 // 提取日志中的PDU短信，解码、去重、发送到钉钉，支持自定义头尾
