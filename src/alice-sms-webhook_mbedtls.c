@@ -14,6 +14,8 @@
 #include <mbedtls/version.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/stat.h>
+
 
 #define MAX_BUFFER_LEN 4096
 
@@ -185,7 +187,7 @@ int find_zte_mifi_pid() {
     return pid;
 }
 
-// strace线程函数 - 执行 strace 跟踪 zte_mifi 进程的 read/write 系统调用
+// 在strace_thread_func中修改重启逻辑，增加日志文件大小检查
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
     
@@ -202,22 +204,30 @@ void* strace_thread_func(void* arg) {
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
-        // 后台定时任务，改为每1分钟重启一次strace
+        // 后台定时任务，改为基于时间和文件大小的重启策略
         if (fork() == 0) {
+            const long MAX_LOG_SIZE = 1 * 1024 * 1024; // 1MB
             while (threads_running) {
-                // 等待60秒或者主线程退出
-                int sec_to_restart = 60; // 改为1分钟
-                int slept = 0;
-                while (slept < sec_to_restart && threads_running) {
-                    int to_sleep = (sec_to_restart - slept) > 10 ? 10 : (sec_to_restart - slept); // 最多睡10秒，以便快速响应主线程退出
-                    sleep(to_sleep);
-                    slept += to_sleep;
+                // 检查日志文件大小
+                struct stat st;
+                if (stat("/tmp/zte_log.txt", &st) == 0 && st.st_size > MAX_LOG_SIZE) {
+                    // 文件过大，立即重启
+                    printf("日志文件过大(%ld bytes)，重启strace\n", st.st_size);
+                } else {
+                    // 否则等待60秒或者主线程退出
+                    int sec_to_restart = 60;
+                    int slept = 0;
+                    while (slept < sec_to_restart && threads_running) {
+                        int to_sleep = (sec_to_restart - slept) > 10 ? 10 : (sec_to_restart - slept);
+                        sleep(to_sleep);
+                        slept += to_sleep;
+                    }
                 }
                 
                 // 如果主线程已退出，则退出循环
                 if (!threads_running) break;
                 
-                // 到时间了，kill本程序fork的strace，清空文件，重启strace
+                // 重启strace
                 pid_t oldpid = get_strace_pid_from_file();
                 if (oldpid > 0) {
                     kill(oldpid, SIGTERM);
@@ -253,7 +263,6 @@ void* strace_thread_func(void* arg) {
             }
             _exit(0);
         }
-        // 等待child进程结束
         waitpid(child, NULL, 0);
     } else {
         perror("fork");
