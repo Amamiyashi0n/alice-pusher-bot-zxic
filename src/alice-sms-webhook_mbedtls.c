@@ -163,7 +163,7 @@ void rerun_strace_zte_mifi() {
     }
 }
 
-// 查找 /sbin/zte_mifi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
+// 查找 /sbin/zte_mifi 或 /sbin/zte_ufi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
 int find_zte_mifi_pid() {
     DIR *dir;
     struct dirent *entry;
@@ -180,7 +180,8 @@ int find_zte_mifi_pid() {
         ssize_t len = readlink(path, buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
-            if (strcmp(buf, "/sbin/zte_mifi") == 0) {
+            // 同时检查两种可能的进程名
+            if (strcmp(buf, "/sbin/zte_mifi") == 0 || strcmp(buf, "/sbin/zte_ufi") == 0) {
                 pid = id;
                 break;
             }
@@ -189,6 +190,7 @@ int find_zte_mifi_pid() {
     closedir(dir);
     return pid;
 }
+
 // 在strace_thread_func中修改重启逻辑，增加日志文件大小检查
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
@@ -417,6 +419,157 @@ static char last_pdu[256] = "";
 static time_t last_pdu_time = 0;
 static time_t service_start_time = 0;
 
+// GSM 7-bit 默认字母表到ASCII的映射表
+static const char gsm7bit_default[128] = {
+    '@', 0x00, '$', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '\n', 0x00, 0x00, '\r', 0x00, 0x00,
+    0x00, '_', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1B, 0x00, 0x00, 0x00, 0x00,
+    ' ', '!', '"', '#', 0x00, '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
+    0x00, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+// GSM 7-bit 扩展字符表 (需要转义字符)
+static const char gsm7bit_ext[128] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '\n', 0x00, 0x00, '\r', 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, '^', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '{', '}', 0x00, 0x00, 0x00, 0x00, 0x00, '\\',
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '[', '~', ']', 0x00,
+    '|', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+// 解码7-bit编码的短信内容
+// 解码7-bit编码的短信内容
+// 解码7-bit编码的短信内容
+void decode_7bit_pdu(const char *pdu_data, int data_len_oct, char *output, size_t output_size) {
+    // 将十六进制字符串转换为二进制数据
+    unsigned char *binary_data = (unsigned char *)malloc(data_len_oct);
+    if (!binary_data) {
+        output[0] = '\0';
+        return;
+    }
+    
+    // 清空输出缓冲区
+    memset(output, 0, output_size);
+    
+    // 将十六进制字符串转换为二进制数据
+    int i, j;
+    for (i = 0; i < data_len_oct && (i * 2 + 1) < (int)strlen(pdu_data); i++) {
+        char hex_byte[3] = {pdu_data[i*2], pdu_data[i*2+1], '\0'};
+        unsigned int byte_val;
+        sscanf(hex_byte, "%x", &byte_val);
+        binary_data[i] = (unsigned char)byte_val;
+    }
+    
+    // 7-bit解码 - 使用位操作方法
+    int out_idx = 0;
+    int bit_offset = 0;
+    
+    // 计算实际的7-bit字符数
+    int total_bits = data_len_oct * 8;
+    int septet_count = total_bits / 7;
+    
+    for (i = 0; i < septet_count && out_idx < (int)output_size - 1; i++) {
+        // 计算当前7-bit字符在数据中的位置
+        int byte_index = bit_offset / 8;
+        int bit_index = bit_offset % 8;
+        
+        if (byte_index >= data_len_oct) {
+            break;
+        }
+        
+        unsigned char septet;
+        if (bit_index <= 1) {
+            // 字符完全在当前字节或跨越当前和下一个字节
+            if (bit_index == 0) {
+                septet = binary_data[byte_index] & 0x7F;
+            } else {
+                if (byte_index + 1 < data_len_oct) {
+                    septet = ((binary_data[byte_index] >> 1) | (binary_data[byte_index + 1] << 7)) & 0x7F;
+                } else {
+                    septet = (binary_data[byte_index] >> 1) & 0x7F;
+                }
+            }
+        } else {
+            // 字符跨越当前和下一个字节
+            if (byte_index + 1 < data_len_oct) {
+                int shift = 8 - bit_index;
+                septet = ((binary_data[byte_index] >> bit_index) | (binary_data[byte_index + 1] << shift)) & 0x7F;
+            } else {
+                septet = (binary_data[byte_index] >> bit_index) & 0x7F;
+            }
+        }
+        
+        // 检查是否是填充字符（在数据末尾）
+        if (i == septet_count - 1 && septet == 0) {
+            // 这可能是填充，跳过
+            break;
+        }
+        
+        // 处理转义字符
+        if (septet == 0x1B) {
+            // 增加位偏移以获取扩展字符
+            bit_offset += 7;
+            i++; // 跳过下一个字符的处理
+            
+            // 获取扩展字符
+            byte_index = bit_offset / 8;
+            bit_index = bit_offset % 8;
+            
+            if (byte_index >= data_len_oct) {
+                break;
+            }
+            
+            unsigned char ext_septet;
+            if (bit_index <= 1) {
+                if (bit_index == 0) {
+                    ext_septet = binary_data[byte_index] & 0x7F;
+                } else {
+                    if (byte_index + 1 < data_len_oct) {
+                        ext_septet = ((binary_data[byte_index] >> 1) | (binary_data[byte_index + 1] << 7)) & 0x7F;
+                    } else {
+                        ext_septet = (binary_data[byte_index] >> 1) & 0x7F;
+                    }
+                }
+            } else {
+                if (byte_index + 1 < data_len_oct) {
+                    int shift = 8 - bit_index;
+                    ext_septet = ((binary_data[byte_index] >> bit_index) | (binary_data[byte_index + 1] << shift)) & 0x7F;
+                } else {
+                    ext_septet = (binary_data[byte_index] >> bit_index) & 0x7F;
+                }
+            }
+            
+            if (ext_septet < 128 && out_idx < (int)output_size - 1) {
+                char ext_char = gsm7bit_ext[ext_septet];
+                if (ext_char != 0) {
+                    output[out_idx++] = ext_char;
+                }
+            }
+        } else {
+            // 处理普通字符
+            if (septet < 128 && out_idx < (int)output_size - 1) {
+                char decoded_char = gsm7bit_default[septet];
+                if (decoded_char != 0) {
+                    output[out_idx++] = decoded_char;
+                } else if (septet >= 32 && septet <= 126) {
+                    // 如果在标准ASCII范围内，直接使用
+                    output[out_idx++] = (char)septet;
+                }
+            }
+        }
+        
+        bit_offset += 7;
+    }
+    
+    output[out_idx] = '\0';
+    free(binary_data);
+}
+
 // 完整的PDU解码，包含SMSC、发件人、时间戳等信息
 void decode_pdu(const char *pdu, sms_info_t *info) {
     memset(info, 0, sizeof(*info));
@@ -443,6 +596,12 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
         }
     }
     info->smsc[j] = 0;
+    
+    // 去除SMSC末尾的F/f字符
+    if (j > 0 && (info->smsc[j-1] == 'F' || info->smsc[j-1] == 'f')) {
+        info->smsc[j-1] = '\0';
+    }
+    
     // 去除多余+86前缀（只保留一次）
     if (strncmp(info->smsc, "86", 2) == 0) {
         memmove(info->smsc, info->smsc + 2, strlen(info->smsc) - 1);
@@ -472,6 +631,12 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
         }
     }
     info->sender[j] = 0;
+    
+    // 去除Sender末尾的F/f字符
+    if (j > 0 && (info->sender[j-1] == 'F' || info->sender[j-1] == 'f')) {
+        info->sender[j-1] = '\0';
+    }
+    
     // 去除多余+86前缀（只保留一次）
     if (strncmp(info->sender, "86", 2) == 0) {
         memmove(info->sender, info->sender + 2, strlen(info->sender) - 1);
@@ -486,7 +651,11 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     strncpy(info->tp_dcs, pdu + idx, 2);
     info->tp_dcs[2] = 0;
     idx += 2;
-    if (strcmp(info->tp_dcs, "08") == 0) {
+    if (strcmp(info->tp_dcs, "00") == 0) {
+        strcpy(info->tp_dcs_desc, "7-bit Default Alphabet");
+        strcpy(info->sms_class, "0");
+        strcpy(info->alphabet, "7-bit");
+    } else if (strcmp(info->tp_dcs, "08") == 0) {
         strcpy(info->tp_dcs_desc, "Uncompressed Text");
         strcpy(info->sms_class, "0");
         strcpy(info->alphabet, "UCS2(16)bit");
@@ -514,28 +683,86 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     idx += 2;
     info->text_len = text_len_oct;
 
-    int ucs2_len = text_len_oct * 2;
-    char ucs2_hex[256] = {0};
-    strncpy(ucs2_hex, pdu + idx, ucs2_len);
-    ucs2_hex[ucs2_len] = 0;
-    k = 0;
-    for (i = 0; i < ucs2_len && k + 3 < (int)sizeof(info->text); i += 4) {
-        unsigned int ucs2;
-        sscanf(ucs2_hex + i, "%4x", &ucs2);
-        if (ucs2 < 0x80) {
-            info->text[k++] = (char)ucs2;
-        } else if (ucs2 < 0x800) {
-            info->text[k++] = 0xC0 | (ucs2 >> 6);
-            info->text[k++] = 0x80 | (ucs2 & 0x3F);
-        } else {
-            info->text[k++] = 0xE0 | (ucs2 >> 12);
-            info->text[k++] = 0x80 | ((ucs2 >> 6) & 0x3F);
-            info->text[k++] = 0x80 | (ucs2 & 0x3F);
+    // 根据TP-DCS决定解码方式
+    if (strcmp(info->tp_dcs, "00") == 0) {
+        // 7-bit编码
+        decode_7bit_pdu(pdu + idx, text_len_oct, info->text, sizeof(info->text));
+    } else if (strcmp(info->tp_dcs, "08") == 0) {
+        // UCS2编码
+        int ucs2_len = text_len_oct * 2;
+        char ucs2_hex[256] = {0};
+        strncpy(ucs2_hex, pdu + idx, ucs2_len);
+        ucs2_hex[ucs2_len] = 0;
+        k = 0;
+        
+        // 使用更可靠的UCS2解码方法
+        for (i = 0; i < ucs2_len && k + 4 < (int)sizeof(info->text) && i + 3 < ucs2_len; i += 4) {
+            // 提取4个字符作为UCS2码点
+            char hex[5] = {0};
+            strncpy(hex, ucs2_hex + i, 4);
+            
+            // 验证是否为有效的十六进制字符
+            int valid = 1;
+            int h;
+            for (h = 0; h < 4; h++) {
+                if (!((hex[h] >= '0' && hex[h] <= '9') || 
+                      (hex[h] >= 'A' && hex[h] <= 'F') || 
+                      (hex[h] >= 'a' && hex[h] <= 'f'))) {
+                    valid = 0;
+                    break;
+                }
+            }
+            
+            if (!valid) {
+                // 如果不是有效的十六进制，尝试作为单字节处理
+                if (i + 1 < ucs2_len) {
+                    char byte_hex[3] = {ucs2_hex[i], ucs2_hex[i+1], 0};
+                    unsigned int byte_val;
+                    if (sscanf(byte_hex, "%x", &byte_val) == 1) {
+                        if (byte_val < 0x80) {
+                            info->text[k++] = (char)byte_val;
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            // 解析UCS2字符
+            unsigned int ucs2_val;
+            if (sscanf(hex, "%4x", &ucs2_val) != 1) {
+                continue;
+            }
+            
+            // 跳过空字符
+            if (ucs2_val == 0) {
+                continue;
+            }
+            
+            // 根据Unicode值转换为UTF-8
+            if (ucs2_val < 0x80) {
+                // ASCII字符 (1字节)
+                info->text[k++] = (char)ucs2_val;
+            } else if (ucs2_val < 0x800) {
+                // 2字节UTF-8
+                info->text[k++] = 0xC0 | (ucs2_val >> 6);
+                info->text[k++] = 0x80 | (ucs2_val & 0x3F);
+            } else {
+                // 3字节UTF-8
+                info->text[k++] = 0xE0 | (ucs2_val >> 12);
+                info->text[k++] = 0x80 | ((ucs2_val >> 6) & 0x3F);
+                info->text[k++] = 0x80 | (ucs2_val & 0x3F);
+            }
+        }
+        info->text[k] = 0;
+    } else {
+        // 默认处理方式（尝试作为简单十六进制处理）
+        int hex_len = text_len_oct * 2;
+        if (hex_len < sizeof(info->text) - 1) {
+            strncpy(info->text, pdu + idx, hex_len);
+            info->text[hex_len] = 0;
         }
     }
-    info->text[k] = 0;
 }
-
 // 为保持兼容性保留的旧函数
 static char last_sms_compat[256] = "";
 static time_t last_sms_time_compat = 0;
@@ -745,7 +972,7 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                                 add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
                                 char msg[512];
                                 snprintf(msg, sizeof(msg),
-                                    "SMSC:%s\nSender:%s\nTimeStamp:%s\nText:%s",
+                                    "短消息服务中心:%s\n发件人:%s\n时间戳:%s\nText:%s",
                                     info.smsc[0] ? info.smsc : "N/A",
                                     info.sender[0] ? info.sender : "N/A",
                                     info.timestamp[0] ? info.timestamp : "N/A",
