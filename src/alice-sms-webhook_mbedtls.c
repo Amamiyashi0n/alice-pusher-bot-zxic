@@ -38,7 +38,10 @@ void rerun_strace_zte_mifi(void);
 static volatile int threads_running = 1;
 static pthread_t strace_thread_id;
 static pthread_t pdu_thread_id;
-
+static pid_t monitor_pid = -1; // 添加这行
+static void set_monitor_pid(pid_t pid) {
+    monitor_pid = pid;
+}
 
 void trace_zte_mifi() {
     int pid = find_zte_mifi_pid();
@@ -186,7 +189,6 @@ int find_zte_mifi_pid() {
     closedir(dir);
     return pid;
 }
-
 // 在strace_thread_func中修改重启逻辑，增加日志文件大小检查
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
@@ -200,69 +202,90 @@ void* strace_thread_func(void* arg) {
     if (child == 0) {
         char pidstr[16];
         snprintf(pidstr, sizeof(pidstr), "%d", pid);
-        execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
+        // 优化strace参数，只跟踪write系统调用，降低CPU占用
+        execl("/sbin/strace", "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
-        // 后台定时任务，改为基于时间和文件大小的重启策略
+        // 后台定时任务，每30秒强制重启strace
         if (fork() == 0) {
-            const long MAX_LOG_SIZE = 1 * 1024 * 1024; // 1MB
+            const long MAX_LOG_SIZE = 1 * 512 * 1024; // 0.5MB
+            int check_count = 0;
+            time_t last_restart_time = time(NULL);
+            const int RESTART_INTERVAL = 30; // 30秒强制重启一次
+            
             while (threads_running) {
-                // 检查日志文件大小
+                check_count++;
+                time_t current_time = time(NULL);
+                
+                // 每30秒强制重启strace进程
+                if ((current_time - last_restart_time) >= RESTART_INTERVAL) {
+                    printf("每30秒强制重启strace进程...\n");
+                    // 重启strace
+                    pid_t oldpid = get_strace_pid_from_file();
+                    if (oldpid > 0) {
+                        kill(oldpid, SIGTERM);
+                        int wait_count = 0;
+                        while (wait_count < 10) {
+                            if (kill(oldpid, 0) != 0) break;
+                            usleep(100*1000);
+                            wait_count++;
+                        }
+                        if (kill(oldpid, 0) == 0) {
+                            kill(oldpid, SIGKILL);
+                            usleep(200*1000);
+                        }
+                        int ztepid = find_zte_mifi_pid();
+                        if (ztepid > 0) {
+                            kill(ztepid, SIGCONT);
+                        }
+                    }
+                    // 使用truncate强制清空文件（0字节填充）
+                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
+                        perror("truncate /tmp/zte_log.txt");
+                    }
+                    int newpid = find_zte_mifi_pid();
+                    if (newpid > 0) {
+                        pid_t c2 = fork();
+                        if (c2 == 0) {
+                            char pidstr2[16];
+                            snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
+                            execl("/sbin/strace", "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
+                            _exit(127);
+                        } else if (c2 > 0) {
+                            set_strace_pid_to_file(c2);
+                        }
+                    }
+                    last_restart_time = current_time;
+                }
+                
+                // 检查日志文件大小（仍然保留此检查作为额外保护）
                 struct stat st;
                 if (stat("/tmp/zte_log.txt", &st) == 0 && st.st_size > MAX_LOG_SIZE) {
-                    // 文件过大，立即重启
-                    printf("日志文件过大(%ld bytes)，重启strace\n", st.st_size);
-                } else {
-                    // 否则等待60秒或者主线程退出
-                    int sec_to_restart = 60;
-                    int slept = 0;
-                    while (slept < sec_to_restart && threads_running) {
-                        int to_sleep = (sec_to_restart - slept) > 10 ? 10 : (sec_to_restart - slept);
-                        sleep(to_sleep);
-                        slept += to_sleep;
+                    // 文件过大，清空文件而不是重启strace
+                    printf("日志文件过大(%ld bytes)，清空文件\n", st.st_size);
+                    // 使用truncate强制清空文件
+                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
+                        perror("truncate /tmp/zte_log.txt");
                     }
+                }
+                
+                // 等待1秒或者主线程退出
+                int sec_to_wait = 1;
+                int slept = 0;
+                while (slept < sec_to_wait && threads_running) {
+                    int to_sleep = (sec_to_wait - slept) > 10 ? 10 : (sec_to_wait - slept);
+                    sleep(to_sleep);
+                    slept += to_sleep;
                 }
                 
                 // 如果主线程已退出，则退出循环
                 if (!threads_running) break;
-                
-                // 重启strace
-                pid_t oldpid = get_strace_pid_from_file();
-                if (oldpid > 0) {
-                    kill(oldpid, SIGTERM);
-                    int wait_count = 0;
-                    while (wait_count < 10) {
-                        if (kill(oldpid, 0) != 0) break;
-                        usleep(100*1000);
-                        wait_count++;
-                    }
-                    if (kill(oldpid, 0) == 0) {
-                        kill(oldpid, SIGKILL);
-                        usleep(200*1000);
-                    }
-                    int ztepid = find_zte_mifi_pid();
-                    if (ztepid > 0) {
-                        kill(ztepid, SIGCONT);
-                    }
-                }
-                FILE *fp = fopen("/tmp/zte_log.txt", "w");
-                if (fp) fclose(fp);
-                int newpid = find_zte_mifi_pid();
-                if (newpid > 0) {
-                    pid_t c2 = fork();
-                    if (c2 == 0) {
-                        char pidstr2[16];
-                        snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
-                        execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
-                        _exit(127);
-                    } else if (c2 > 0) {
-                        set_strace_pid_to_file(c2);
-                    }
-                }
             }
             _exit(0);
         }
+        // 添加短暂延迟，避免忙等待
+        usleep(100000); // 0.1秒
         waitpid(child, NULL, 0);
     } else {
         perror("fork");
@@ -789,6 +812,15 @@ void signal_handler(int sig) {
         usleep(100*1000);
         if (kill(strace_pid, 0) == 0) {
             kill(strace_pid, SIGKILL);
+        }
+    }
+    
+    // 强制杀死监控进程
+    if (monitor_pid > 0) {
+        kill(monitor_pid, SIGTERM);
+        usleep(100*1000);
+        if (kill(monitor_pid, 0) == 0) {
+            kill(monitor_pid, SIGKILL);
         }
     }
     
