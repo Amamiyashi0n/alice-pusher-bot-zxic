@@ -43,7 +43,7 @@ static void set_monitor_pid(pid_t pid) {
     monitor_pid = pid;
 }
 
-void trace_zte_mifi() {
+/* void trace_zte_mifi() {
     int pid = find_zte_mifi_pid();
     if (pid <= 0) {
         fprintf(stderr, "zte_mifi进程未找到\n");
@@ -105,7 +105,7 @@ void trace_zte_mifi() {
     } else {
         perror("fork");
     }
-}
+} */
 
 // 用文件记录strace子进程pid，便于跨进程kill
 static pid_t get_strace_pid_from_file() {
@@ -123,7 +123,7 @@ static void set_strace_pid_to_file(pid_t pid) {
         fclose(fp);
     }
 }
-
+/* 
 // 立即清空 /tmp/zte_log.txt 并重启 strace 跟踪（优雅kill，保护zte_mifi）
 void rerun_strace_zte_mifi() {
     pid_t oldpid = get_strace_pid_from_file();
@@ -162,6 +162,7 @@ void rerun_strace_zte_mifi() {
         }
     }
 }
+ */
 
 // 查找 /sbin/zte_mifi 或 /sbin/zte_ufi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
 int find_zte_mifi_pid() {
@@ -1056,18 +1057,12 @@ void signal_handler(int sig) {
 
 int main(int argc, char *argv[]) {
     int only_service_mode = 0;
-    int only_strace_mode = 0;
-    int only_rerun_mode = 0;
     int only_send_once_mode = 0; // 新增
     char *headtxt = NULL, *tailtxt = NULL;
     int i;
+    
+    // 解析命令行参数
     for (i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--mode=strace_zte_mifi") == 0)) {
-            only_strace_mode = 1;
-        }
-        if ((strcmp(argv[i], "--mode=re-run-strace_zte_mifi") == 0)) {
-            only_rerun_mode = 1;
-        }
         if ((strcmp(argv[i], "--mode=service_start") == 0)) {
             only_service_mode = 1;
         }
@@ -1081,14 +1076,7 @@ int main(int argc, char *argv[]) {
             tailtxt = argv[i] + 10;
         }
     }
-    if (only_strace_mode && argc == 2) {
-        trace_zte_mifi();
-        return 0;
-    }
-    if (only_rerun_mode && argc == 2) {
-        rerun_strace_zte_mifi();
-        return 0;
-    }
+    
     if (only_service_mode) {
         service_start_time = time(NULL);
         char *webhook = NULL;
@@ -1116,6 +1104,7 @@ int main(int argc, char *argv[]) {
         pthread_join(pdu_thread_id, NULL);
         return 0;
     }
+    
     if (only_send_once_mode) {
         char *url = NULL, *msgtype = NULL, *txt = NULL;
         for (i = 1; i < argc; i++) {
@@ -1218,6 +1207,7 @@ int main(int argc, char *argv[]) {
         mbedtls_entropy_free(&entropy);
         return ret;
     }
+    
     // 保持原有兼容模式
     char *url = NULL, *msgtype = NULL, *txt = NULL;
     for (i = 1; i < argc; i++) {
