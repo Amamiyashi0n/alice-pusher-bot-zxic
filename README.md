@@ -8,4 +8,4 @@
 开源协议目前暂定GPL3.0协议，后续这个文档会写的更详细些
 
 > 赞助链接
-> ![_cgi-bin_mmwebwx-bin_webwxgetmsgimg__ MsgID=6847265001315583793 skey=@crypt_a0f0a04e_7abbd89cc95ffd02eecf0a0c1bd573c7 mmweb_appid=wx_webfilehelper](https://github.com/user-attachments/assets/5b90fb47-93a1-410b-9ec8-f89cd6a12858)
+> ![Uploading _cgi-bin_mmwebwx-bin_webwxgetmsgimg__&MsgID=6847265001315583793&skey=@crypt_a0f0a04e_7abbd89cc95ffd02eecf0a0c1bd573c7&mmweb_appid=wx_webfilehelper-gigapixel-standard-scale-0_25x.jpg…]()
