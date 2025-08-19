@@ -25,20 +25,18 @@ static pid_t get_strace_pid_from_file(void);
 static void set_strace_pid_to_file(pid_t pid);
 void extract_write_lines_from_log(void);
 void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen);
-void send_dingtalk_msg(const char *webhook, const char *txt);
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt);
+void send_dingtalk_msg(const char *webhook, const char *txt, const char *keyword);
+void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword);
 void print_mbedtls_error(int ret, const char *msg);
 void parse_url(const char *url, char **host, char **path);
 void signal_handler(int sig);
 int find_zte_mifi_pid(void);
-void trace_zte_mifi(void);
-void rerun_strace_zte_mifi(void);
 
 // 线程控制变量
 static volatile int threads_running = 1;
 static pthread_t strace_thread_id;
 static pthread_t pdu_thread_id;
-static pid_t monitor_pid = -1; // 添加这行
+static pid_t monitor_pid = -1;
 static void set_monitor_pid(pid_t pid) {
     monitor_pid = pid;
 }
@@ -207,11 +205,13 @@ void* pdu_thread_func(void* arg) {
     char* webhook = args[0];
     char* headtxt = args[1];
     char* tailtxt = args[2];
+    char* keyword = args[3]; // 添加keyword参数
 
     // 添加线程清理处理程序
     pthread_cleanup_push(free, webhook);
     pthread_cleanup_push(free, headtxt);
     pthread_cleanup_push(free, tailtxt);
+    pthread_cleanup_push(free, keyword); // 添加keyword清理
     pthread_cleanup_push(free, args);
 
     time_t last_size = 0;
@@ -223,12 +223,13 @@ void* pdu_thread_func(void* arg) {
             fclose(fp);
             if (size != last_size) {
                 last_size = size;
-                extract_and_send_sms_from_log(webhook, headtxt, tailtxt);
+                extract_and_send_sms_from_log(webhook, headtxt, tailtxt, keyword);
             }
         }
         usleep(1000*1000); // 1秒轮询
     }
     
+    pthread_cleanup_pop(1);
     pthread_cleanup_pop(1);
     pthread_cleanup_pop(1);
     pthread_cleanup_pop(1);
@@ -699,7 +700,7 @@ void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen) {
 }
 
 // 发送钉钉消息接口（只支持text）
-void send_dingtalk_msg(const char *webhook, const char *txt) {
+void send_dingtalk_msg(const char *webhook, const char *txt, const char *keyword) {
     // 构造钉钉 content 字段，带 Msg: 换行和 text:，并做严格JSON安全转义
     char safe_txt[512];
     int i = 0, j = 0;
@@ -723,8 +724,16 @@ void send_dingtalk_msg(const char *webhook, const char *txt) {
         i++;
     }
     safe_txt[j] = 0;
+    
+    // 构造完整内容，使用keyword替代默认的"Msg:"
     char content[1024];
-    snprintf(content, sizeof(content), "Msg:\\n%s", safe_txt);
+    if (keyword) {
+        snprintf(content, sizeof(content), "%s\\n%s", keyword, safe_txt);
+    } else {
+        // 如果没有指定keyword，使用默认的"Msg:"
+        snprintf(content, sizeof(content), "Msg:\\n%s", safe_txt);
+    }
+    
     // 构造完整 JSON
     char json_msg[2048];
     snprintf(json_msg, sizeof(json_msg), "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", content);
@@ -809,8 +818,8 @@ cleanup:
     mbedtls_entropy_free(&entropy);
 }
 
-// 提取日志中的PDU短信，解码、去重、发送到钉钉，支持自定义头尾
-void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt) {
+// 提取日志中的PDU短信，解码、去重、发送到钉钉，支持自定义头尾和keyword
+void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword) {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) return;
     char line[2048];
@@ -883,7 +892,7 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                                     info.sender[0] ? info.sender : "N/A",
                                     info.timestamp[0] ? info.timestamp : "N/A",
                                     info.text);
-                                send_dingtalk_msg(webhook, msg);
+                                send_dingtalk_msg(webhook, msg, keyword);
                             } else {
                                 printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
                             }
@@ -964,6 +973,7 @@ int main(int argc, char *argv[]) {
     int only_service_mode = 0;
     int only_send_once_mode = 0; // 新增
     char *headtxt = NULL, *tailtxt = NULL;
+    char *keyword = NULL; // 添加keyword变量
     int i;
     
     // 解析命令行参数
@@ -979,6 +989,10 @@ int main(int argc, char *argv[]) {
         }
         if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
             tailtxt = argv[i] + 10;
+        }
+        // 添加对--keyword参数的解析
+        if (strncmp(argv[i], "--keyword=", 10) == 0) {
+            keyword = argv[i] + 10;
         }
         // 添加对--targetbin参数的解析
         if (strncmp(argv[i], "--targetbin=", 12) == 0) {
@@ -1017,7 +1031,8 @@ int main(int argc, char *argv[]) {
             perror("Failed to create strace thread");
             return 1;
         }
-        char* pdu_args[3] = {webhook, headtxt, tailtxt};
+        // 修改传递给PDU线程的参数，包含keyword
+        char* pdu_args[4] = {webhook, headtxt, tailtxt, keyword};
         if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func, pdu_args) != 0) {
             perror("Failed to create PDU thread");
             return 1;
