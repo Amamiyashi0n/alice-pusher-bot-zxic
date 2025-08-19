@@ -43,128 +43,33 @@ static void set_monitor_pid(pid_t pid) {
     monitor_pid = pid;
 }
 
-/* void trace_zte_mifi() {
-    int pid = find_zte_mifi_pid();
-    if (pid <= 0) {
-        fprintf(stderr, "zte_mifi进程未找到\n");
-        return;
-    }
-    pid_t child = fork();
-    if (child == 0) {
-        char pidstr[16];
-        snprintf(pidstr, sizeof(pidstr), "%d", pid);
-        execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
-        _exit(127);
-    } else if (child > 0) {
-        set_strace_pid_to_file(child);
-        // 新增：后台定时任务，每天0点清空并重启strace
-        if (fork() == 0) {
-            while (1) {
-                time_t now = time(NULL);
-                struct tm *tm_now = localtime(&now);
-                int sec_to_midnight = (23 - tm_now->tm_hour) * 3600 + (59 - tm_now->tm_min) * 60 + (60 - tm_now->tm_sec);
-                if (sec_to_midnight <= 0 || sec_to_midnight > 86400) sec_to_midnight = 1; // 容错
-                sleep(sec_to_midnight);
-                // 0点到，kill本程序fork的strace，清空文件，重启strace（同样优雅kill）
-                pid_t oldpid = get_strace_pid_from_file();
-                if (oldpid > 0) {
-                    kill(oldpid, SIGTERM);
-                    int wait_count = 0;
-                    while (wait_count < 10) {
-                        if (kill(oldpid, 0) != 0) break;
-                        usleep(100*1000);
-                        wait_count++;
-                    }
-                    if (kill(oldpid, 0) == 0) {
-                        kill(oldpid, SIGKILL);
-                        usleep(200*1000);
-                    }
-                    int ztepid = find_zte_mifi_pid();
-                    if (ztepid > 0) {
-                        kill(ztepid, SIGCONT);
-                    }
-                }
-                FILE *fp = fopen("/tmp/zte_log.txt", "w");
-                if (fp) fclose(fp);
-                int newpid = find_zte_mifi_pid();
-                if (newpid > 0) {
-                    pid_t c2 = fork();
-                    if (c2 == 0) {
-                        char pidstr2[16];
-                        snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
-                        execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
-                        _exit(127);
-                    } else if (c2 > 0) {
-                        set_strace_pid_to_file(c2);
-                    }
-                }
-            }
-            _exit(0);
-        }
-        waitpid(child, NULL, 0);
-    } else {
-        perror("fork");
-    }
-} */
+// 添加全局变量存储完整的zte_mifi和zte_ufi路径
+static char zte_mifi_path[256] = "/sbin/zte_mifi";
+static char zte_ufi_path[256] = "/sbin/zte_ufi";
+// 添加strace路径变量
+static char strace_bin_path[256] = "/sbin/strace";
 
-// 用文件记录strace子进程pid，便于跨进程kill
-static pid_t get_strace_pid_from_file() {
-    FILE *fp = fopen("/tmp/zte_strace.pid", "r");
-    if (!fp) return 0;
-    pid_t pid = 0;
-    fscanf(fp, "%d", &pid);
+// PID文件操作函数实现
+static pid_t get_strace_pid_from_file(void) {
+    FILE *fp = fopen("/tmp/strace_pid.txt", "r");
+    if (!fp) return -1;
+    pid_t pid;
+    if (fscanf(fp, "%d", &pid) != 1) {
+        fclose(fp);
+        return -1;
+    }
     fclose(fp);
     return pid;
 }
-static void set_strace_pid_to_file(pid_t pid) {
-    FILE *fp = fopen("/tmp/zte_strace.pid", "w");
-    if (fp) {
-        fprintf(fp, "%d", pid);
-        fclose(fp);
-    }
-}
-/* 
-// 立即清空 /tmp/zte_log.txt 并重启 strace 跟踪（优雅kill，保护zte_mifi）
-void rerun_strace_zte_mifi() {
-    pid_t oldpid = get_strace_pid_from_file();
-    if (oldpid > 0) {
-        // 优先SIGTERM优雅退出
-        kill(oldpid, SIGTERM);
-        int wait_count = 0;
-        while (wait_count < 10) { // 最多等1秒
-            if (kill(oldpid, 0) != 0) break; // 已退出
-            usleep(100*1000);
-            wait_count++;
-        }
-        // 若还在则SIGKILL
-        if (kill(oldpid, 0) == 0) {
-            kill(oldpid, SIGKILL);
-            usleep(200*1000);
-        }
-        // 杀完strace后，给zte_mifi发SIGCONT，防止其被挂起
-        int ztepid = find_zte_mifi_pid();
-        if (ztepid > 0) {
-            kill(ztepid, SIGCONT);
-        }
-    }
-    FILE *fp = fopen("/tmp/zte_log.txt", "w");
-    if (fp) fclose(fp);
-    int newpid = find_zte_mifi_pid();
-    if (newpid > 0) {
-        pid_t c2 = fork();
-        if (c2 == 0) {
-            char pidstr2[16];
-            snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
-            execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
-            _exit(127);
-        } else if (c2 > 0) {
-            set_strace_pid_to_file(c2);
-        }
-    }
-}
- */
 
-// 查找 /sbin/zte_mifi 或 /sbin/zte_ufi 的进程 pid，返回第一个找到的 pid，找不到返回 -1
+static void set_strace_pid_to_file(pid_t pid) {
+    FILE *fp = fopen("/tmp/strace_pid.txt", "w");
+    if (!fp) return;
+    fprintf(fp, "%d", pid);
+    fclose(fp);
+}
+
+// 查找指定路径的zte_mifi或zte_ufi进程 pid，返回第一个找到的 pid，找不到返回 -1
 int find_zte_mifi_pid() {
     DIR *dir;
     struct dirent *entry;
@@ -181,8 +86,8 @@ int find_zte_mifi_pid() {
         ssize_t len = readlink(path, buf, sizeof(buf) - 1);
         if (len > 0) {
             buf[len] = '\0';
-            // 同时检查两种可能的进程名
-            if (strcmp(buf, "/sbin/zte_mifi") == 0 || strcmp(buf, "/sbin/zte_ufi") == 0) {
+            // 检查是否匹配指定的完整路径
+            if (strcmp(buf, zte_mifi_path) == 0 || strcmp(buf, zte_ufi_path) == 0) {
                 pid = id;
                 break;
             }
@@ -192,7 +97,7 @@ int find_zte_mifi_pid() {
     return pid;
 }
 
-// 在strace_thread_func中修改重启逻辑，增加日志文件大小检查
+// 修改strace_thread_func函数以使用自定义strace路径
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
     
@@ -206,7 +111,7 @@ void* strace_thread_func(void* arg) {
         char pidstr[16];
         snprintf(pidstr, sizeof(pidstr), "%d", pid);
         // 优化strace参数，只跟踪write系统调用，降低CPU占用
-        execl("/sbin/strace", "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
+        execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
@@ -253,7 +158,7 @@ void* strace_thread_func(void* arg) {
                         if (c2 == 0) {
                             char pidstr2[16];
                             snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
-                            execl("/sbin/strace", "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
+                            execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
                             _exit(127);
                         } else if (c2 > 0) {
                             set_strace_pid_to_file(c2);
@@ -1075,7 +980,24 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--tailtxt=", 10) == 0) {
             tailtxt = argv[i] + 10;
         }
+        // 添加对--targetbin参数的解析
+        if (strncmp(argv[i], "--targetbin=", 12) == 0) {
+            const char *mifi_path = argv[i] + 12;
+            if (strlen(mifi_path) < sizeof(zte_mifi_path) - 1) {
+                strncpy(zte_mifi_path, mifi_path, sizeof(zte_mifi_path) - 1);
+                zte_mifi_path[sizeof(zte_mifi_path) - 1] = '\0';
+            }
+        }
+        // 添加对--tracebin参数的解析
+        if (strncmp(argv[i], "--tracebin=", 11) == 0) {
+            const char *path = argv[i] + 11;
+            if (strlen(path) < sizeof(strace_bin_path) - 1) {
+                strncpy(strace_bin_path, path, sizeof(strace_bin_path) - 1);
+                strace_bin_path[sizeof(strace_bin_path) - 1] = '\0';
+            }
+        }
     }
+    
     
     if (only_service_mode) {
         service_start_time = time(NULL);
