@@ -109,7 +109,7 @@ void* strace_thread_func(void* arg) {
         char pidstr[16];
         snprintf(pidstr, sizeof(pidstr), "%d", pid);
         // 优化strace参数，只跟踪write系统调用，降低CPU占用
-        execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
+        execl(strace_bin_path, "strace", "-f", "-e", "trace=read", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
