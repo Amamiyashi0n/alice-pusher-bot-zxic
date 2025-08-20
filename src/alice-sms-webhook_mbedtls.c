@@ -16,9 +16,24 @@
 #include <signal.h>
 #include <sys/stat.h>
 
-
 #define MAX_BUFFER_LEN 4096
 
+// 用于限制PDU的最大长度
+#define MAX_PDU_LENGTH 512
+
+// 添加连续检测结构体
+typedef struct {
+    char sender[32];
+    char timestamp[32];
+    char text[256];
+    int count;
+    time_t last_seen;
+} sms_detection_t;
+
+#define DETECTION_WINDOW_SIZE 10
+static sms_detection_t detection_window[DETECTION_WINDOW_SIZE];
+static int detection_head = 0;
+static int detection_count = 0;
 
 // 函数声明
 static pid_t get_strace_pid_from_file(void);
@@ -109,7 +124,7 @@ void* strace_thread_func(void* arg) {
         char pidstr[16];
         snprintf(pidstr, sizeof(pidstr), "%d", pid);
         // 优化strace参数，只跟踪write系统调用，降低CPU占用
-        execl(strace_bin_path, "strace", "-f", "-e", "trace=read", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
+        execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
@@ -270,7 +285,7 @@ typedef struct {
     char tp_dcs_desc[32];
     char sms_class[8];
     char alphabet[32];
-    char text[128];
+    char text[512];
     int text_len;
 } sms_info_t;
 
@@ -285,6 +300,75 @@ static sms_uniq_t sms_uniq_queue[SMS_UNIQ_QUEUE_SIZE];
 static int sms_uniq_head = 0;
 static int sms_uniq_count = 0;
 
+// 检查是否在连续检测窗口中
+int is_sms_in_detection_window(const char *sender, const char *timestamp, const char *text) {
+    int i;
+    for (i = 0; i < detection_count; i++) {
+        int idx = (detection_head + i) % DETECTION_WINDOW_SIZE;
+        if (strcmp(detection_window[idx].sender, sender) == 0 &&
+            strcmp(detection_window[idx].timestamp, timestamp) == 0 &&
+            strcmp(detection_window[idx].text, text) == 0) {
+            return idx; // 返回索引
+        }
+    }
+    return -1; // 未找到
+}
+
+// 添加到连续检测窗口
+void add_sms_to_detection_window(const char *sender, const char *timestamp, const char *text) {
+    int idx = is_sms_in_detection_window(sender, timestamp, text);
+    
+    // 如果已存在，增加计数
+    if (idx != -1) {
+        detection_window[idx].count++;
+        detection_window[idx].last_seen = time(NULL);
+        return;
+    }
+    
+    // 添加新条目
+    int new_idx;
+    if (detection_count < DETECTION_WINDOW_SIZE) {
+        new_idx = (detection_head + detection_count) % DETECTION_WINDOW_SIZE;
+        detection_count++;
+    } else {
+        new_idx = detection_head;
+        detection_head = (detection_head + 1) % DETECTION_WINDOW_SIZE;
+    }
+    
+    strncpy(detection_window[new_idx].sender, sender, sizeof(detection_window[new_idx].sender)-1);
+    detection_window[new_idx].sender[sizeof(detection_window[new_idx].sender)-1] = 0;
+    
+    strncpy(detection_window[new_idx].timestamp, timestamp, sizeof(detection_window[new_idx].timestamp)-1);
+    detection_window[new_idx].timestamp[sizeof(detection_window[new_idx].timestamp)-1] = 0;
+    
+    strncpy(detection_window[new_idx].text, text, sizeof(detection_window[new_idx].text)-1);
+    detection_window[new_idx].text[sizeof(detection_window[new_idx].text)-1] = 0;
+    
+    detection_window[new_idx].count = 1;
+    detection_window[new_idx].last_seen = time(NULL);
+}
+
+// 清理过期的检测条目（超过30秒的条目）
+void cleanup_detection_window() {
+    time_t now = time(NULL);
+    int i = 0;
+    while (i < detection_count) {
+        int idx = (detection_head + i) % DETECTION_WINDOW_SIZE;
+        if (now - detection_window[idx].last_seen > 30) {
+            // 移除这个条目
+            if (idx == detection_head) {
+                detection_head = (detection_head + 1) % DETECTION_WINDOW_SIZE;
+                detection_count--;
+            } else {
+                // 简单处理：只清理头部过期条目
+                break;
+            }
+        } else {
+            i++;
+        }
+    }
+}
+
 int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *text) {
     int i;
     for (i = 0; i < sms_uniq_count; i++) {
@@ -297,6 +381,7 @@ int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *
     }
     return 0;
 }
+
 void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char *text) {
     int idx;
     if (sms_uniq_count < SMS_UNIQ_QUEUE_SIZE) {
@@ -342,15 +427,14 @@ static const char gsm7bit_default[128] = {
 static const char gsm7bit_ext[128] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '\n', 0x00, 0x00, '\r', 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, '^', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '{', '}', 0x00, 0x00, 0x00, 0x00, 0x00, '\\',
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '{', '}', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, '[', '~', ']', 0x00,
     '|', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
-// 解码7-bit编码的短信内容
-// 解码7-bit编码的短信内容
+
 // 解码7-bit编码的短信内容
 void decode_7bit_pdu(const char *pdu_data, int data_len_oct, char *output, size_t output_size) {
     // 将十六进制字符串转换为二进制数据
@@ -481,25 +565,48 @@ void decode_7bit_pdu(const char *pdu_data, int data_len_oct, char *output, size_
 void decode_pdu(const char *pdu, sms_info_t *info) {
     memset(info, 0, sizeof(*info));
     int idx = 0;
+    int pdu_len = strlen(pdu);
+    
+    // 添加长度检查，防止处理过短的PDU
+    if (pdu_len < 10) {
+        return;
+    }
+    
     int smsc_len = 0;
     int i, j, k; // 统一声明循环变量
+    
     sscanf(pdu, "%2x", &smsc_len);
     idx += 2;
+    
+    // 添加边界检查
+    if (idx >= pdu_len) return;
+    
     int smsc_type = 0;
     sscanf(pdu + idx, "%2x", &smsc_type);
     idx += 2;
+    
+    if (idx >= pdu_len) return;
+    
     int smsc_bcd_len = (smsc_len - 1) * 2;
     char smsc_bcd[32] = {0};
-    strncpy(smsc_bcd, pdu + idx, smsc_bcd_len);
-    smsc_bcd[smsc_bcd_len] = 0;
+    
+    // 确保不会越界复制
+    int copy_len = (smsc_bcd_len < (pdu_len - idx)) ? smsc_bcd_len : (pdu_len - idx);
+    copy_len = (copy_len < 31) ? copy_len : 31;
+    strncpy(smsc_bcd, pdu + idx, copy_len);
+    smsc_bcd[copy_len] = 0;
     idx += smsc_bcd_len;
+    
     j = 0;
-    for (i = 0; i < smsc_bcd_len; i += 2) {
+    for (i = 0; i < smsc_bcd_len && i < (int)sizeof(smsc_bcd)-1 && j < (int)sizeof(info->smsc)-1; i += 2) {
+        if (idx >= pdu_len) break;
         if (smsc_bcd[i+1] == 'F' || smsc_bcd[i+1] == 'f') {
             info->smsc[j++] = smsc_bcd[i];
         } else {
             info->smsc[j++] = smsc_bcd[i+1];
-            info->smsc[j++] = smsc_bcd[i];
+            if (j < (int)sizeof(info->smsc)-1) {
+                info->smsc[j++] = smsc_bcd[i];
+            }
         }
     }
     info->smsc[j] = 0;
@@ -514,27 +621,41 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
         memmove(info->smsc, info->smsc + 2, strlen(info->smsc) - 1);
     }
 
+    // 添加更多边界检查
+    if (idx + 2 >= pdu_len) return;
     idx += 2; // PDU类型
+    
+    if (idx + 2 >= pdu_len) return;
     int sender_len = 0;
     sscanf(pdu + idx, "%2x", &sender_len);
     idx += 2;
+    
+    if (idx + 2 >= pdu_len) return;
     int sender_type = 0;
     sscanf(pdu + idx, "%2x", &sender_type);
     idx += 2;
+    
     int sender_bcd_len = (sender_len % 2 == 0) ? sender_len : sender_len + 1;
     sender_bcd_len /= 2;
     sender_bcd_len *= 2;
+    
     char sender_bcd[32] = {0};
-    strncpy(sender_bcd, pdu + idx, sender_bcd_len);
-    sender_bcd[sender_bcd_len] = 0;
+    copy_len = (sender_bcd_len < (pdu_len - idx)) ? sender_bcd_len : (pdu_len - idx);
+    copy_len = (copy_len < 31) ? copy_len : 31;
+    strncpy(sender_bcd, pdu + idx, copy_len);
+    sender_bcd[copy_len] = 0;
     idx += sender_bcd_len;
+    
     j = 0;
-    for (i = 0; i < sender_bcd_len; i += 2) {
+    for (i = 0; i < sender_bcd_len && i < (int)sizeof(sender_bcd)-1 && j < (int)sizeof(info->sender)-1; i += 2) {
+        if (idx >= pdu_len) break;
         if (sender_bcd[i+1] == 'F' || sender_bcd[i+1] == 'f') {
             info->sender[j++] = sender_bcd[i];
         } else {
             info->sender[j++] = sender_bcd[i+1];
-            info->sender[j++] = sender_bcd[i];
+            if (j < (int)sizeof(info->sender)-1) {
+                info->sender[j++] = sender_bcd[i];
+            }
         }
     }
     info->sender[j] = 0;
@@ -550,14 +671,19 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     }
 
     // TP_PID
-    strncpy(info->tp_pid, pdu + idx, 2);
-    info->tp_pid[2] = 0;
-    idx += 2;
+    if (idx + 2 <= pdu_len) {
+        strncpy(info->tp_pid, pdu + idx, 2);
+        info->tp_pid[2] = 0;
+        idx += 2;
+    }
 
     // TP_DCS
-    strncpy(info->tp_dcs, pdu + idx, 2);
-    info->tp_dcs[2] = 0;
-    idx += 2;
+    if (idx + 2 <= pdu_len) {
+        strncpy(info->tp_dcs, pdu + idx, 2);
+        info->tp_dcs[2] = 0;
+        idx += 2;
+    }
+    
     if (strcmp(info->tp_dcs, "00") == 0) {
         strcpy(info->tp_dcs_desc, "7-bit Default Alphabet");
         strcpy(info->sms_class, "0");
@@ -573,106 +699,118 @@ void decode_pdu(const char *pdu, sms_info_t *info) {
     }
 
     // 时间戳
-    char ts[15] = {0};
-    strncpy(ts, pdu + idx, 14);
-    ts[14] = 0;
-    idx += 14;
-    char dt[32] = {0};
-    for (i = 0; i < 12; i += 2) {
-        dt[i] = ts[i+1];
-        dt[i+1] = ts[i];
+    if (idx + 14 <= pdu_len) {
+        char ts[15] = {0};
+        strncpy(ts, pdu + idx, 14);
+        ts[14] = 0;
+        idx += 14;
+        char dt[32] = {0};
+        for (i = 0; i < 12 && i < (int)sizeof(ts)-1; i += 2) {
+            dt[i] = ts[i+1];
+            dt[i+1] = ts[i];
+        }
+        snprintf(info->timestamp, sizeof(info->timestamp), "%c%c/%c%c/%c%c %c%c:%c%c:%c%c",
+            dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8], dt[9], dt[10], dt[11]);
     }
-    snprintf(info->timestamp, sizeof(info->timestamp), "%c%c/%c%c/%c%c %c%c:%c%c:%c%c",
-        dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dt[6], dt[7], dt[8], dt[9], dt[10], dt[11]);
 
+    if (idx + 2 > pdu_len) return;
     int text_len_oct = 0;
     sscanf(pdu + idx, "%2x", &text_len_oct);
     idx += 2;
     info->text_len = text_len_oct;
 
-    // 根据TP-DCS决定解码方式
-    if (strcmp(info->tp_dcs, "00") == 0) {
+    // 根据TP-DCS决定解码方式，添加边界检查
+    if (strcmp(info->tp_dcs, "00") == 0 && idx < pdu_len) {
         // 7-bit编码
-        decode_7bit_pdu(pdu + idx, text_len_oct, info->text, sizeof(info->text));
-    } else if (strcmp(info->tp_dcs, "08") == 0) {
+        int available_len = (pdu_len - idx) / 2;
+        decode_7bit_pdu(pdu + idx, (text_len_oct < available_len) ? text_len_oct : available_len, info->text, sizeof(info->text));
+    } else if (strcmp(info->tp_dcs, "08") == 0 && idx < pdu_len) {
         // UCS2编码
         int ucs2_len = text_len_oct * 2;
-        char ucs2_hex[256] = {0};
-        strncpy(ucs2_hex, pdu + idx, ucs2_len);
-        ucs2_hex[ucs2_len] = 0;
-        k = 0;
+        int available_len = pdu_len - idx;
+        int process_len = (ucs2_len < available_len) ? ucs2_len : available_len;
         
-        // 使用更可靠的UCS2解码方法
-        for (i = 0; i < ucs2_len && k + 4 < (int)sizeof(info->text) && i + 3 < ucs2_len; i += 4) {
-            // 提取4个字符作为UCS2码点
-            char hex[5] = {0};
-            strncpy(hex, ucs2_hex + i, 4);
+        if (process_len > 0) {
+            char ucs2_hex[256] = {0};
+            int copy_len = (process_len < 255) ? process_len : 255;
+            strncpy(ucs2_hex, pdu + idx, copy_len);
+            ucs2_hex[copy_len] = 0;
             
-            // 验证是否为有效的十六进制字符
-            int valid = 1;
-            int h;
-            for (h = 0; h < 4; h++) {
-                if (!((hex[h] >= '0' && hex[h] <= '9') || 
-                      (hex[h] >= 'A' && hex[h] <= 'F') || 
-                      (hex[h] >= 'a' && hex[h] <= 'f'))) {
-                    valid = 0;
-                    break;
-                }
-            }
-            
-            if (!valid) {
-                // 如果不是有效的十六进制，尝试作为单字节处理
-                if (i + 1 < ucs2_len) {
-                    char byte_hex[3] = {ucs2_hex[i], ucs2_hex[i+1], 0};
-                    unsigned int byte_val;
-                    if (sscanf(byte_hex, "%x", &byte_val) == 1) {
-                        if (byte_val < 0x80) {
-                            info->text[k++] = (char)byte_val;
-                        }
+            k = 0;
+            // 使用更可靠的UCS2解码方法
+            for (i = 0; i < copy_len && k + 4 < (int)sizeof(info->text) && i + 3 < copy_len; i += 4) {
+                // 提取4个字符作为UCS2码点
+                char hex[5] = {0};
+                strncpy(hex, ucs2_hex + i, 4);
+                
+                // 验证是否为有效的十六进制字符
+                int valid = 1;
+                int h;
+                for (h = 0; h < 4; h++) {
+                    if (!((hex[h] >= '0' && hex[h] <= '9') || 
+                          (hex[h] >= 'A' && hex[h] <= 'F') || 
+                          (hex[h] >= 'a' && hex[h] <= 'f'))) {
+                        valid = 0;
+                        break;
                     }
                 }
-                continue;
+                
+                if (!valid) {
+                    // 如果不是有效的十六进制，尝试作为单字节处理
+                    if (i + 1 < copy_len) {
+                        char byte_hex[3] = {ucs2_hex[i], ucs2_hex[i+1], 0};
+                        unsigned int byte_val;
+                        if (sscanf(byte_hex, "%x", &byte_val) == 1) {
+                            if (byte_val < 0x80 && k < (int)sizeof(info->text) - 1) {
+                                info->text[k++] = (char)byte_val;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                
+                // 解析UCS2字符
+                unsigned int ucs2_val;
+                if (sscanf(hex, "%4x", &ucs2_val) != 1) {
+                    continue;
+                }
+                
+                // 跳过空字符
+                if (ucs2_val == 0) {
+                    continue;
+                }
+                
+                // 根据Unicode值转换为UTF-8
+                if (ucs2_val < 0x80 && k < (int)sizeof(info->text) - 1) {
+                    // ASCII字符 (1字节)
+                    info->text[k++] = (char)ucs2_val;
+                } else if (ucs2_val < 0x800 && k < (int)sizeof(info->text) - 2) {
+                    // 2字节UTF-8
+                    info->text[k++] = 0xC0 | (ucs2_val >> 6);
+                    info->text[k++] = 0x80 | (ucs2_val & 0x3F);
+                } else if (k < (int)sizeof(info->text) - 3) {
+                    // 3字节UTF-8
+                    info->text[k++] = 0xE0 | (ucs2_val >> 12);
+                    info->text[k++] = 0x80 | ((ucs2_val >> 6) & 0x3F);
+                    info->text[k++] = 0x80 | (ucs2_val & 0x3F);
+                }
             }
-            
-            // 解析UCS2字符
-            unsigned int ucs2_val;
-            if (sscanf(hex, "%4x", &ucs2_val) != 1) {
-                continue;
-            }
-            
-            // 跳过空字符
-            if (ucs2_val == 0) {
-                continue;
-            }
-            
-            // 根据Unicode值转换为UTF-8
-            if (ucs2_val < 0x80) {
-                // ASCII字符 (1字节)
-                info->text[k++] = (char)ucs2_val;
-            } else if (ucs2_val < 0x800) {
-                // 2字节UTF-8
-                info->text[k++] = 0xC0 | (ucs2_val >> 6);
-                info->text[k++] = 0x80 | (ucs2_val & 0x3F);
-            } else {
-                // 3字节UTF-8
-                info->text[k++] = 0xE0 | (ucs2_val >> 12);
-                info->text[k++] = 0x80 | ((ucs2_val >> 6) & 0x3F);
-                info->text[k++] = 0x80 | (ucs2_val & 0x3F);
-            }
+            info->text[k] = 0;
         }
-        info->text[k] = 0;
-    } else {
+    } else if (idx < pdu_len) {
         // 默认处理方式（尝试作为简单十六进制处理）
         int hex_len = text_len_oct * 2;
-        if (hex_len < sizeof(info->text) - 1) {
-            strncpy(info->text, pdu + idx, hex_len);
-            info->text[hex_len] = 0;
+        int available_len = pdu_len - idx;
+        int process_len = (hex_len < available_len) ? hex_len : available_len;
+        
+        if (process_len > 0 && process_len < sizeof(info->text) - 1) {
+            strncpy(info->text, pdu + idx, process_len);
+            info->text[process_len] = 0;
         }
     }
 }
-// 为保持兼容性保留的旧函数
-static char last_sms_compat[256] = "";
-static time_t last_sms_time_compat = 0;
+
+
 
 void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen) {
     // 假设pdu内容全为UCS2编码的16进制字符串
@@ -818,34 +956,50 @@ cleanup:
     mbedtls_entropy_free(&entropy);
 }
 
-// 提取日志中的PDU短信，解码、去重、发送到钉钉，支持自定义头尾和keyword
+// 修改 extract_and_send_sms_from_log 函数
 void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword) {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) return;
     char line[2048];
     regex_t reg;
-    // 匹配如: write(16, "...", 91) = 91，兼容C regex语法，不用\s和\)
     regcomp(&reg, "^[ \t]*write\\([0-9]+, \".*\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
     int line_num = 0;
+    time_t start_time = time(NULL);
+    
+    // PDU去重队列 - 用于防止相同PDU重复发送
+    static char pdu_sent_queue[50][512];
+    static int pdu_sent_count = 0;
+    static int pdu_sent_head = 0;
+    
+    // 在函数开始处声明所有变量
+    sms_info_t info;
+    char *first_crlf, *pdu_start, *pdu_end;
+    char pdu[512];
+    char *pdubegin, *pdu_trim, *pdutail;
+    size_t textlen;
+    int detection_idx, already_sent;
+    int i, idx;
+    char decoded_info[512];
+    char msg[1024];
+    size_t pdu_len, pi;
+    int valid_pdu;
+    
     while (fgets(line, sizeof(line), fp)) {
+        // 添加超时检查，防止函数执行过久
+        if (time(NULL) - start_time > 30) {
+            printf("[WARN] extract_and_send_sms_from_log timeout\n");
+            break;
+        }
+        
         line_num++;
         int is_write = (regexec(&reg, line, 0, NULL, 0) == 0);
         char *p = strstr(line, "+CMT: ");
-        // printf("[DEBUG] line %d: %s", line_num, line);
-        // printf("[DEBUG] is_write: %d\n", is_write);
-        // printf("[DEBUG] +CMT: pos: %ld\n", p ? (long)(p-line) : -1L);
         if (p) {
-            // 修改这里：在strace输出中，换行符是字符串"\r\n"而不是实际的\r\n字符
-            char *first_crlf = strstr(p, "\\r\\n");
-            printf("[DEBUG] first_crlf pos: %ld\n", first_crlf ? (long)(first_crlf-line) : -1L);
+            first_crlf = strstr(p, "\\r\\n");
             if (first_crlf) {
-                // 修改这里：跳过"\r\n"字符串（4个字符）
-                char *pdu_start = first_crlf + 4;
-                printf("[DEBUG] pdu_start offset: %ld\n", (long)(pdu_start-line));
-                // 同样查找结束标记也需要查找字符串"\r\n"
-                char *pdu_end = strstr(pdu_start, "\\r\\n");
-                if (pdu_end) printf("[DEBUG] pdu_end offset: %ld\n", (long)(pdu_end-line));
-                char pdu[256] = "";
+                pdu_start = first_crlf + 4;
+                pdu_end = strstr(pdu_start, "\\r\\n");
+                memset(pdu, 0, sizeof(pdu));  // 清空缓冲区
                 if (pdu_end && pdu_end > pdu_start && (pdu_end - pdu_start) < (int)sizeof(pdu)) {
                     strncpy(pdu, pdu_start, pdu_end - pdu_start);
                     pdu[pdu_end - pdu_start] = 0;
@@ -853,20 +1007,15 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                     strncpy(pdu, pdu_start, sizeof(pdu)-1);
                     pdu[sizeof(pdu)-1] = 0;
                 }
-                printf("[DEBUG] pdu_raw: %s\n", pdu);
-                printf("[DEBUG] pdu_raw_len: %zu\n", strlen(pdu));
-                char *pdubegin = pdu;
+                pdubegin = pdu;
                 while (*pdubegin && (*pdubegin == ' ' || *pdubegin == '\t')) pdubegin++;
-                char *pdu_trim = pdubegin;
-                char *pdutail = pdu_trim + strlen(pdu_trim) - 1;
+                pdu_trim = pdubegin;
+                pdutail = pdu_trim + strlen(pdu_trim) - 1;
                 while (pdutail > pdu_trim && (*pdutail == ' ' || *pdutail == '\t')) *pdutail-- = 0;
-                printf("[DEBUG] pdu_trim: %s\n", pdu_trim);
-                printf("[DEBUG] pdu_trim_len: %zu\n", strlen(pdu_trim));
                 if (pdu_trim[0]) {
                     // 过滤异常PDU：长度至少20且全为十六进制字符
-                    int valid_pdu = 1;
-                    size_t pdu_len = strlen(pdu_trim);
-                    size_t pi;
+                    valid_pdu = 1;
+                    pdu_len = strlen(pdu_trim);
                     if (pdu_len < 20) valid_pdu = 0;
                     for (pi = 0; pi < pdu_len; pi++) {
                         char c = pdu_trim[pi];
@@ -876,25 +1025,68 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                         }
                     }
                     if (valid_pdu) {
-                        sms_info_t info;
+                        // 先进行PDU解码以获取基本信息
+                        printf("[DEBUG] pdu_trim - %s\n",pdu_trim), 
+                        memset(&info, 0, sizeof(info));
                         decode_pdu(pdu_trim, &info);
-                        printf("[DEBUG] sms_decoded: %s\n", info.text);
-                        printf("[DEBUG] sms_decoded_len: %zu\n", strlen(info.text));
-                        size_t textlen = strlen(info.text);
-                        if (textlen > 0) { // 只推送有内容的短信
-                            // 新去重机制：Sender+TimeStamp+Text三元组唯一
-                            if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
-                                add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
-                                char msg[512];
-                                snprintf(msg, sizeof(msg),
-                                    "短消息服务中心:%s\n发件人:%s\n时间戳:%s\nText:%s",
-                                    info.smsc[0] ? info.smsc : "N/A",
-                                    info.sender[0] ? info.sender : "N/A",
-                                    info.timestamp[0] ? info.timestamp : "N/A",
-                                    info.text);
-                                send_dingtalk_msg(webhook, msg, keyword);
+                        textlen = strlen(info.text);
+                        
+                        // 添加调试信息输出，显示解码后的中文信息
+                        printf("[DEBUG] Decoded SMS - Sender: %s, Timestamp: %s, Text: %s\n", 
+                               info.sender, info.timestamp, info.text);
+                        
+                        if (textlen > 0) {
+                            // 清理过期的检测条目
+                            cleanup_detection_window();
+                            
+                            // 添加到连续检测窗口并检查是否达到3次
+                            add_sms_to_detection_window(info.sender, info.timestamp, info.text);
+                            detection_idx = is_sms_in_detection_window(info.sender, info.timestamp, info.text);
+                            
+                            // 检查是否在检测窗口中且计数达到3次
+                            if (detection_idx != -1 && detection_window[detection_idx].count >= 3) {
+                                // 检查是否已经发送过相同的PDU
+                                already_sent = 0;
+                                for (i = 0; i < pdu_sent_count; i++) {
+                                    idx = (pdu_sent_head + i) % 50;
+                                    if (strcmp(pdu_sent_queue[idx], pdu_trim) == 0) {
+                                        already_sent = 1;
+                                        printf("[DEBUG] skip already sent pdu: %s\n", pdu_trim);
+                                        break;
+                                    }
+                                }
+                                
+                                // 如果未发送过，则发送并添加到已发送队列
+                                if (!already_sent) {
+                                    // 处理PDU，显示解码后的信息和原始PDU
+                                    snprintf(decoded_info, sizeof(decoded_info),
+                                        "短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
+                                        info.smsc[0] ? info.smsc : "N/A",
+                                        info.sender[0] ? info.sender : "N/A",
+                                        info.timestamp[0] ? info.timestamp : "N/A",
+                                        info.text);
+                                    
+                                    // 始终包含原始PDU，不再进行长度判断
+                                    snprintf(msg, sizeof(msg),
+                                        "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下：\n%s",
+                                        decoded_info,
+                                        pdu_trim);
+                                    
+                                    send_dingtalk_msg(webhook, msg, keyword);
+                                    
+                                    // 添加到已发送PDU队列
+                                    if (pdu_sent_count < 50) {
+                                        strcpy(pdu_sent_queue[(pdu_sent_head + pdu_sent_count) % 50], pdu_trim);
+                                        pdu_sent_count++;
+                                    } else {
+                                        strcpy(pdu_sent_queue[pdu_sent_head], pdu_trim);
+                                        pdu_sent_head = (pdu_sent_head + 1) % 50;
+                                    }
+                                }
                             } else {
-                                printf("[DEBUG] skip duplicate sms: Sender=%s, TimeStamp=%s, Text=%s\n", info.sender, info.timestamp, info.text);
+                                printf("[DEBUG] sms not yet confirmed (count=%d): Sender=%s, TimeStamp=%s, Text=%s\n", 
+                                       detection_idx != -1 ? detection_window[detection_idx].count : 0,
+                                       info.sender, info.timestamp, info.text);
                             }
                         }
                     } else {
