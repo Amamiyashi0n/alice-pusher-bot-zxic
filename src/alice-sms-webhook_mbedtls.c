@@ -124,7 +124,7 @@ void* strace_thread_func(void* arg) {
         char pidstr[16];
         snprintf(pidstr, sizeof(pidstr), "%d", pid);
         // 优化strace参数，只跟踪write系统调用，降低CPU占用
-        execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
+        execl(strace_bin_path, "strace", "-f", "-e", "trace=read", "-s", "1024", "-p", pidstr, "-o", "/tmp/zte_log.txt", (char*)NULL);
         _exit(127);
     } else if (child > 0) {
         set_strace_pid_to_file(child);
@@ -171,7 +171,7 @@ void* strace_thread_func(void* arg) {
                         if (c2 == 0) {
                             char pidstr2[16];
                             snprintf(pidstr2, sizeof(pidstr2), "%d", newpid);
-                            execl(strace_bin_path, "strace", "-f", "-e", "trace=write", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
+                            execl(strace_bin_path, "strace", "-f", "-e", "trace=read", "-s", "1024", "-p", pidstr2, "-o", "/tmp/zte_log.txt", (char*)NULL);
                             _exit(127);
                         } else if (c2 > 0) {
                             set_strace_pid_to_file(c2);
@@ -253,7 +253,7 @@ void* pdu_thread_func(void* arg) {
     return NULL;
 }
 
-// 提取 /tmp/zte_log.txt 中所有 write(数字, "内容", 数字) = 数字 的行
+// 提取 /tmp/zte_log.txt 中所有 read(数字, "内容", 数字) = 数字 的行
 void extract_write_lines_from_log() {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) {
@@ -261,10 +261,10 @@ void extract_write_lines_from_log() {
         return;
     }
     char line[2048];
-    // 匹配 write(数字, "内容", 数字) = 数字
+    // 匹配 read(数字, "内容", 数字) = 数字
     regex_t reg;
-    // 匹配如: write(16, "...", 91) = 91
-    regcomp(&reg, "^\\s*write\\([0-9]+, \\\".*\\\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
+    // 匹配如: read(16, "...", 91) = 91
+    regcomp(&reg, "^\\s*read\\([0-9]+, \\\".*\\\", [0-9]+\\) = [0-9]+", REG_EXTENDED);
     while (fgets(line, sizeof(line), fp)) {
         if (regexec(&reg, line, 0, NULL, 0) == 0) {
             printf("%s", line);
@@ -955,8 +955,7 @@ cleanup:
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
 }
-
-// 修改 extract_and_send_sms_from_log 函数
+// 修改 extract_and_send_sms_from_log 函数，在发送钉钉消息后清空日志文件
 void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword) {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) return;
@@ -1066,13 +1065,28 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                                         info.timestamp[0] ? info.timestamp : "N/A",
                                         info.text);
                                     
-                                    // 始终包含原始PDU，不再进行长度判断
-                                    snprintf(msg, sizeof(msg),
-                                        "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下：\n%s",
-                                        decoded_info,
-                                        pdu_trim);
+                                    // 构造消息内容，确保headtxt在keyword之前
+                                    char full_msg[1024];
+                                    if (headtxt) {
+                                        snprintf(full_msg, sizeof(full_msg),
+                                            "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
+                                            headtxt,
+                                            decoded_info,
+                                            pdu_trim);
+                                    } else {
+                                        snprintf(full_msg, sizeof(full_msg),
+                                            "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
+                                            decoded_info,
+                                            pdu_trim);
+                                    }
                                     
-                                    send_dingtalk_msg(webhook, msg, keyword);
+                                    send_dingtalk_msg(webhook, full_msg, keyword);
+                                    
+                                    // <<<<<<<<< 在这里添加清空日志文件的代码 >>>>>>>>>
+                                    // 使用truncate强制清空文件（0字节填充）
+                                    if (truncate("/tmp/zte_log.txt", 0) != 0) {
+                                        perror("truncate /tmp/zte_log.txt");
+                                    }
                                     
                                     // 添加到已发送PDU队列
                                     if (pdu_sent_count < 50) {
