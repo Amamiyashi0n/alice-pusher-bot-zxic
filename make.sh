@@ -18,7 +18,7 @@ if [ ! -d "${MBEDTLS_DIR}" ]; then
 fi 
 
 # 设置源文件路径（当前目录的src/alice-sms-webhook_mbedtls.c） 
-SRC_FILE=$(pwd)/src/alice-sms-pusher.c
+SRC_FILE=$(pwd)/src/alice-sms-webhook_mbedtls.c 
 
 # 检查源文件是否存在 
 if [ ! -f "${SRC_FILE}" ]; then 
@@ -69,16 +69,16 @@ make -j$(nproc)
 cd .. 
 
 # 编译指定的C文件，使用优化选项 
-${CC} ${CFLAGS} -I${MBEDTLS_DIR}/include ${SRC_FILE} -o ${OUTPUT_DIR}/alice-sms-pusher \
+${CC} ${CFLAGS} -I${MBEDTLS_DIR}/include ${SRC_FILE} -o ${OUTPUT_DIR}/alice-sms-webhook_mbedtls \
     ${LDFLAGS} -L${MBEDTLS_DIR}/library -lmbedtls -lmbedx509 -lmbedcrypto -pthread
 
 # 检查是否生成了可执行文件 
-if [ -f "${OUTPUT_DIR}/alice-sms-pusher" ]; then 
+if [ -f "${OUTPUT_DIR}/alice-sms-webhook_mbedtls" ]; then 
     # 使用strip移除符号表和调试信息 
-    ${STRIP} --strip-all ${OUTPUT_DIR}/alice-sms-pusher
+    ${STRIP} --strip-all ${OUTPUT_DIR}/alice-sms-webhook_mbedtls 
     echo "编译完成！" 
-    echo "可执行文件位置: ${OUTPUT_DIR}/alice-sms-pusher" 
-    echo "优化后文件大小: $(du -h ${OUTPUT_DIR}/alice-sms-pusher| cut -f1)" 
+    echo "可执行文件位置: ${OUTPUT_DIR}/alice-sms-webhook_mbedtls" 
+    echo "优化后文件大小: $(du -h ${OUTPUT_DIR}/alice-sms-webhook_mbedtls | cut -f1)" 
 else 
     echo "编译失败：未能生成可执行文件" 
     exit 1 
