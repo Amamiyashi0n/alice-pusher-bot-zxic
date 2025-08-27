@@ -35,6 +35,9 @@ typedef struct {
 static sms_detection_t detection_window[DETECTION_WINDOW_SIZE];
 static int detection_head = 0;
 static int detection_count = 0;
+// 接收短信状态变量
+static volatile int sms_receiving = 0;  // 标记是否正在接收短信
+static time_t last_sms_activity = 0;    // 上次短信活动时间
 
 // SIM卡号相关全局变量
 static char global_sim_number[32] = {0};
@@ -132,7 +135,7 @@ static const int BASE_RESTART_INTERVAL = 30;    // 基础重启间隔(秒)
 static const int MAX_RESTART_INTERVAL = 60;     // 最大重启间隔(秒)
 static const int INTERVAL_EXTENSION = 5;        // 每次检测到短信时的延长时间(秒)
 
-// 过滤乱码字符的函数 - 按GB2312字符集范围过滤
+// 过滤乱码字符的函数 - 按GB2312字符集范围过滤，保留所有GB2312支持的字符包括标点符号
 void filter_garbage_chars(char *text) {
     if (!text) return;
     
@@ -177,23 +180,38 @@ void filter_garbage_chars(char *text) {
             continue;
         }
         
-        // 检查ASCII字符 (0x00-0x7F)
+        // 检查ASCII字符 (0x00-0x7F) - 完全保留
         if (c < 0x80) {
             // 保留所有ASCII字符（包括控制字符、数字、字母、标点符号等）
             text[j++] = c;
             i++;
         } 
-        // 检查UTF-8多字节字符
+        // 检查UTF-8 2字节字符
         else if ((c & 0xE0) == 0xC0) {
             // 2字节UTF-8字符
             if ((i + 1 < len) && ((text[i+1] & 0xC0) == 0x80)) {
                 unsigned char c2 = text[i+1];
-                // 检查是否在GB2312支持的2字节字符范围内
-                // GB2312的2字节字符主要是CJK符号和标点
-                // 范围: U+3000 to U+303F (0xE3 0x80 0x80 to 0xE3 0x80 0xBF)
-                // 范围: U+FF00 to U+FFEF (0xEF 0xBC 0x80 to 0xEF 0xBF 0xAF)
-                if ((c == 0xE3 && c2 >= 0x80 && c2 <= 0x80) ||  // 特定范围检查
-                    (c == 0xEF && c2 >= 0xBC && c2 <= 0xBF)) {
+                
+                // 检查是否在GB2312支持的字符范围内
+                // GB2312 2字节字符范围:
+                // 1. CJK符号和标点: U+3000-U+303F (0xE3 0x80 0x80 - 0xE3 0x80 0xBF)
+                // 2. 全角ASCII、全角片假平假名: U+FF00-U+FFEF (0xEF 0xBC 0x80 - 0xEF 0xBF 0xAF)
+                // 3. 半宽片假名: U+FF61-U+FF9F (0xEF 0xBD 0xA1 - 0xEF 0xBE 0x9F)
+                int is_valid_gb2312 = 0;
+                
+                // CJK符号和标点范围 (包括【】《》""''等中文标点)
+                if (c == 0xE3 && c2 >= 0x80 && c2 <= 0xBF) {
+                    is_valid_gb2312 = 1;
+                }
+                // 全角字符范围 (包括中文标点符号)
+                else if (c == 0xEF) {
+                    if ((c2 >= 0xBC && c2 <= 0xBF) ||  // 全角ASCII等
+                        (c2 >= 0xBD && c2 <= 0xBE)) {  // 半宽片假名等
+                        is_valid_gb2312 = 1;
+                    }
+                }
+                
+                if (is_valid_gb2312) {
                     // 保留有效的2字节字符
                     text[j++] = text[i++];
                     text[j++] = text[i++];
@@ -212,29 +230,23 @@ void filter_garbage_chars(char *text) {
                 
                 // 检查是否在GB2312支持的中文字符范围内
                 // GB2312中文字符范围:
-                // 一级汉字: U+4E00 to U+7FFF 
+                // 一级汉字: U+4E00 to U+9FFF 
                 // 二级汉字: U+3400 to U+4DFF
                 // 其他兼容字符
                 int is_valid_gb2312 = 0;
                 
                 // 一级汉字区 (常用汉字)
-                if (c == 0xE4 && c2 >= 0xB8 && c2 <= 0xBF) {
-                    is_valid_gb2312 = 1;
-                } else if (c == 0xE5 && c2 >= 0x80 && c2 <= 0xBF) {
-                    is_valid_gb2312 = 1;
-                } else if (c == 0xE6 && c2 >= 0x80 && c2 <= 0xBF) {
-                    is_valid_gb2312 = 1;
-                } else if (c == 0xE7 && c2 >= 0x80 && c2 <= 0xBF) {
-                    is_valid_gb2312 = 1;
-                } else if (c == 0xE8 && c2 >= 0x80 && c2 <= 0xBF) {
-                    is_valid_gb2312 = 1;
-                } else if (c == 0xE9 && c2 >= 0x80 && c2 <= 0xBF) {
+                if ((c == 0xE4 && c2 >= 0xB8 && c2 <= 0xBF) ||
+                    (c == 0xE5 && c2 >= 0x80 && c2 <= 0xBF) ||
+                    (c == 0xE6 && c2 >= 0x80 && c2 <= 0xBF) ||
+                    (c == 0xE7 && c2 >= 0x80 && c2 <= 0xBF) ||
+                    (c == 0xE8 && c2 >= 0x80 && c2 <= 0xBF) ||
+                    (c == 0xE9 && c2 >= 0x80 && c2 <= 0xBF)) {
                     is_valid_gb2312 = 1;
                 }
                 // 二级汉字区和其他兼容汉字
-                else if (c == 0xE3 && c2 >= 0x90 && c2 <= 0x94) {
-                    is_valid_gb2312 = 1;
-                } else if (c == 0xE4 && c2 >= 0x90 && c2 <= 0xB7) {
+                else if ((c == 0xE3 && c2 >= 0x90 && c2 <= 0x9F) ||
+                         (c == 0xE4 && c2 >= 0x90 && c2 <= 0xB7)) {
                     is_valid_gb2312 = 1;
                 }
                 
@@ -435,8 +447,7 @@ void cleanup_long_sms_tracker() {
     }
 }
 
-// 修改strace_thread_func函数以使用自定义strace路径
-
+// 修改strace_thread_func函数，添加更精确的重启前短信接收检查
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
     
@@ -487,6 +498,57 @@ void* strace_thread_func(void* arg) {
                 
                 // 检查是否需要重启strace进程
                 if ((current_time - last_restart_time) >= current_restart_interval) {
+                    // 在重启前检查是否正在接收匹配write(1, ...)格式的短信
+                    int should_delay_restart = 0;
+                    
+                    // 检查/tmp/zte_log.txt中是否存在匹配write(1, ...)格式的短信
+                    FILE *fp = fopen("/tmp/zte_log.txt", "r");
+                    if (fp) {
+                        char line[4096];
+                        regex_t reg;
+                        regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
+                        
+                        while (fgets(line, sizeof(line), fp)) {
+                            if (regexec(&reg, line, 0, NULL, 0) == 0) {
+                                should_delay_restart = 1;
+                                printf("[DEBUG] Found write(1, ...) SMS pattern, will delay strace restart\n");
+                                break;
+                            }
+                        }
+                        regfree(&reg);
+                        fclose(fp);
+                    }
+                    
+                    if (should_delay_restart) {
+                        // 如果检测到匹配的短信，延迟5秒再检查
+                        printf("检测到正在接收匹配的短信(write(1, ...))，延迟5秒重启strace进程...\n");
+                        sleep(5);
+                        
+                        // 再次检查是否仍在接收短信
+                        int still_receiving = 0;
+                        fp = fopen("/tmp/zte_log.txt", "r");
+                        if (fp) {
+                            char line[4096];
+                            regex_t reg;
+                            regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
+                            
+                            while (fgets(line, sizeof(line), fp)) {
+                                if (regexec(&reg, line, 0, NULL, 0) == 0) {
+                                    still_receiving = 1;
+                                    break;
+                                }
+                            }
+                            regfree(&reg);
+                            fclose(fp);
+                        }
+                        
+                        if (still_receiving) {
+                            printf("仍在接收匹配的短信，再延迟5秒重启strace进程...\n");
+                            sleep(5);
+                        }
+                    }
+                    
+                    // 最终检查并重启strace进程
                     printf("重启strace进程，当前间隔: %d秒...\n", current_restart_interval);
                     // 重启strace
                     pid_t oldpid = get_strace_pid_from_file();
@@ -561,7 +623,7 @@ void* strace_thread_func(void* arg) {
     return NULL;
 }
 
-// 修改pdu_thread_func函数
+// 修改pdu_thread_func函数，只在匹配write(1, ...)格式时更新短信接收状态
 void* pdu_thread_func(void* arg) {
     char** args = (char**)arg;
     char* webhook = args[0];
@@ -588,6 +650,33 @@ void* pdu_thread_func(void* arg) {
             fclose(fp);
             if (size != last_size) {
                 last_size = size;
+                
+                // 只有在实际处理匹配的短信时才更新接收状态
+                // 先检查是否存在匹配write(1, ...)格式的短信
+                int has_sms_content = 0;
+                fp = fopen("/tmp/zte_log.txt", "r");
+                if (fp) {
+                    char line[4096];
+                    regex_t reg;
+                    regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
+                    
+                    while (fgets(line, sizeof(line), fp)) {
+                        if (regexec(&reg, line, 0, NULL, 0) == 0) {
+                            has_sms_content = 1;
+                            break;
+                        }
+                    }
+                    regfree(&reg);
+                    fclose(fp);
+                }
+                
+                if (has_sms_content) {
+                    // 标记正在接收短信
+                    sms_receiving = 1;
+                    last_sms_activity = time(NULL);
+                    printf("[DEBUG] SMS receiving detected, updating activity timestamp\n");
+                }
+                
                 extract_and_send_sms_from_log(webhook, headtxt, tailtxt, keyword, number);
                 // 当检测到日志文件变化时，更新最后检测到短信的时间
                 last_sms_detected_time = time(NULL);
@@ -598,10 +687,41 @@ void* pdu_thread_func(void* arg) {
         time_t current_time = time(NULL);
         if (current_time - last_check_time >= 5) {
             printf("[DEBUG] 5-second check cycle triggered\n");
+            
+            // 检查是否存在匹配write(1, ...)格式的短信
+            int has_sms_content = 0;
+            fp = fopen("/tmp/zte_log.txt", "r");
+            if (fp) {
+                char line[4096];
+                regex_t reg;
+                regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
+                
+                while (fgets(line, sizeof(line), fp)) {
+                    if (regexec(&reg, line, 0, NULL, 0) == 0) {
+                        has_sms_content = 1;
+                        break;
+                    }
+                }
+                regfree(&reg);
+                fclose(fp);
+            }
+            
+            if (has_sms_content) {
+                // 标记正在处理短信
+                sms_receiving = 1;
+                last_sms_activity = time(NULL);
+                printf("[DEBUG] SMS content detected in 5-second check, updating activity timestamp\n");
+            }
+            
             extract_and_send_sms_from_log(webhook, headtxt, tailtxt, keyword, number);
             last_check_time = current_time;
             // 当触发5秒检查时，也更新最后检测到短信的时间
             last_sms_detected_time = time(NULL);
+        }
+        
+        // 如果超过2秒没有活动，标记为非接收状态
+        if (time(NULL) - last_sms_activity > 2) {
+            sms_receiving = 0;
         }
         
         usleep(1000*1000); // 1秒轮询
@@ -617,7 +737,9 @@ void* pdu_thread_func(void* arg) {
     return NULL;
 }
 
-// 提取 /tmp/zte_log.txt 中所有 write(数字, "内容", 数字) 的行
+
+
+// 修改 extract_write_lines_from_log 函数，只匹配特定格式的短信信息
 void extract_write_lines_from_log() {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) {
@@ -625,10 +747,10 @@ void extract_write_lines_from_log() {
         return;
     }
     char line[2048];
-    // 修改匹配 write(数字, "内容", 数字) 的正则表达式，不包括后面的 = 数字部分
+    // 修改匹配 write(1, ...) 格式的正则表达式
     regex_t reg;
-    // 匹配如: write(13, "...", 268)
-    regcomp(&reg, "^\\s*(\\[pid [0-9]+\\] )?write\\([0-9]+, \\\".*\\\", [0-9]+\\)", REG_EXTENDED);
+    // 只匹配write(1, ...)格式的短信信息
+    regcomp(&reg, "^\\s*(\\[pid [0-9]+\\] )?write\\(1, \\\".*\\+CMT:.*\\\", [0-9]+\\)", REG_EXTENDED);
     while (fgets(line, sizeof(line), fp)) {
         if (regexec(&reg, line, 0, NULL, 0) == 0) {
             printf("%s", line);
@@ -1851,14 +1973,14 @@ cleanup:
     mbedtls_entropy_free(&entropy);
 }
 
-// 修改 extract_and_send_sms_from_log 函数定义，添加number参数
+// 修改 extract_and_send_sms_from_log 函数，只匹配特定格式的短信信息
 void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, const char *tailtxt, const char *keyword, const char *number) {
     FILE *fp = fopen("/tmp/zte_log.txt", "r");
     if (!fp) return;
     char line[4096];
     regex_t reg;
-    // 修改正则表达式以匹配所有格式的 write 调用，包括带 pid 前缀的
-    regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\([0-9]+, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
+    // 修改正则表达式，只匹配write(1, ...)格式的短信信息
+    regcomp(&reg, "^[ \t]*(\\[pid [0-9]+\\] )?write\\(1, \"(\\\\\\\\n)?\\\\r\\\\n\\+CMT:.*\", [0-9]+", REG_EXTENDED);
     int line_num = 0;
     time_t start_time = time(NULL);
     
