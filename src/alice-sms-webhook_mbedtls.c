@@ -112,7 +112,7 @@ void signal_handler(int sig);
 int find_zte_mifi_pid(void);
 char* get_sim_number_from_nv(void);
 void init_sim_number(void);
-void filter_garbage_chars(char *text); // 新增函数声明
+char* filter_garbage_chars(const char *text);
 
 // 线程控制变量
 static volatile int threads_running = 1;
@@ -135,148 +135,97 @@ static const int BASE_RESTART_INTERVAL = 30;    // 基础重启间隔(秒)
 static const int MAX_RESTART_INTERVAL = 60;     // 最大重启间隔(秒)
 static const int INTERVAL_EXTENSION = 5;        // 每次检测到短信时的延长时间(秒)
 
-// 过滤乱码字符的函数 - 按GB2312字符集范围过滤，保留所有GB2312支持的字符包括标点符号
-void filter_garbage_chars(char *text) {
-    if (!text) return;
+// 替换原有的filter_garbage_chars函数为以下版本：
+char* filter_garbage_chars(const char *text) {
+    if (!text) return NULL;
     
     size_t len = strlen(text);
-    if (len == 0) return;
+    if (len == 0) return strdup(""); // 返回空字符串的副本
     
-    // 过滤乱码字符序列"Ԁϵ̃"
-    char *garbage_seq = "Ԁϵ̃";
-    char *pos = strstr(text, garbage_seq);
-    if (pos) {
-        size_t seq_len = strlen(garbage_seq);
-        size_t after_seq = (pos - text) + seq_len;
-        memmove(pos, text + after_seq, len - after_seq + 1);
-    }
-    
-    // 过滤单个乱码字符
-    // "Ԁ" (U+0500) UTF-8: 0xD4 0x80
-    // "ϵ" (U+03F5) UTF-8: 0xCF 0xB5
-    // "̃" (U+0303) UTF-8: 0xCC 0x83 (组合字符)
-    // "΅" (U+0385) UTF-8: 0xCD 0x85
-    // "ȁ" (U+0101) UTF-8: 0xC4 0x81
+    // 分配足够大的缓冲区存储过滤后的文本
+    char *filtered_text = (char*)malloc(len + 1);
+    if (!filtered_text) return NULL;
     
     int i, j;
     for (i = 0, j = 0; text[i] != '\0'; ) {
         unsigned char c = (unsigned char)text[i];
         
-        // 检查是否是已知的乱码字符UTF-8序列
-        if (c == 0xD4 && (unsigned char)text[i+1] == 0x80) { // Ԁ
-            i += 2; // 跳过该字符
-            continue;
-        } else if (c == 0xCF && (unsigned char)text[i+1] == 0xB5) { // ϵ
-            i += 2; // 跳过该字符
-            continue;
-        } else if (c == 0xCC && (unsigned char)text[i+1] == 0x83) { // ̃
-            i += 2; // 跳过该字符
-            continue;
-        } else if (c == 0xCD && (unsigned char)text[i+1] == 0x85) { // ΅
-            i += 2; // 跳过该字符
-            continue;
-        } else if (c == 0xC4 && (unsigned char)text[i+1] == 0x81) { // ȁ
-            i += 2; // 跳过该字符
+        // ASCII字符范围 (0x00-0x7F)
+        if (c <= 0x7F) {
+            // 保留常见的ASCII字符（英语字母、数字、标点符号）
+            if ((c >= 'A' && c <= 'Z') ||    // 大写英文字母
+                (c >= 'a' && c <= 'z') ||    // 小写英文字母
+                (c >= '0' && c <= '9') ||    // 数字
+                c == ' ' || c == '\n' || c == '\r' || c == '\t' ||  // 空格和换行符
+                c == '.' || c == ',' || c == '!' || c == '?' ||     // 常见英语标点
+                c == ';' || c == ':' || c == '\'' || c == '"' ||
+                c == '(' || c == ')' || c == '[' || c == ']' ||
+                c == '{' || c == '}' || c == '-' || c == '_' ||
+                c == '+' || c == '=' || c == '*' || c == '/' ||
+                c == '\\' || c == '|' || c == '<' || c == '>' ||
+                c == '@' || c == '#' || c == '$' || c == '%' ||
+                c == '^' || c == '&' || c == '~' || c == '`') {
+                filtered_text[j++] = c;
+            }
+            // 其他ASCII字符将被过滤掉（替换为空）
+            i++;
             continue;
         }
         
-        // 检查ASCII字符 (0x00-0x7F) - 完全保留
-        if (c < 0x80) {
-            // 保留所有ASCII字符（包括控制字符、数字、字母、标点符号等）
-            text[j++] = c;
-            i++;
-        } 
-        // 检查UTF-8 2字节字符
-        else if ((c & 0xE0) == 0xC0) {
-            // 2字节UTF-8字符
-            if ((i + 1 < len) && ((text[i+1] & 0xC0) == 0x80)) {
-                unsigned char c2 = text[i+1];
-                
-                // 检查是否在GB2312支持的字符范围内
-                // GB2312 2字节字符范围:
-                // 1. CJK符号和标点: U+3000-U+303F (0xE3 0x80 0x80 - 0xE3 0x80 0xBF)
-                // 2. 全角ASCII、全角片假平假名: U+FF00-U+FFEF (0xEF 0xBC 0x80 - 0xEF 0xBF 0xAF)
-                // 3. 半宽片假名: U+FF61-U+FF9F (0xEF 0xBD 0xA1 - 0xEF 0xBE 0x9F)
-                int is_valid_gb2312 = 0;
-                
-                // CJK符号和标点范围 (包括【】《》""''等中文标点)
-                if (c == 0xE3 && c2 >= 0x80 && c2 <= 0xBF) {
-                    is_valid_gb2312 = 1;
-                }
-                // 全角字符范围 (包括中文标点符号)
-                else if (c == 0xEF) {
-                    if ((c2 >= 0xBC && c2 <= 0xBF) ||  // 全角ASCII等
-                        (c2 >= 0xBD && c2 <= 0xBE)) {  // 半宽片假名等
-                        is_valid_gb2312 = 1;
-                    }
-                }
-                
-                if (is_valid_gb2312) {
-                    // 保留有效的2字节字符
-                    text[j++] = text[i++];
-                    text[j++] = text[i++];
-                } else {
-                    // 跳过不符合GB2312范围的2字节字符（如希腊文等）
-                    i += 2;
-                }
+        // UTF-8多字节字符处理
+        // 检查是否是完整的UTF-8序列
+        if ((c & 0xE0) == 0xC0) {  // 2字节字符 (U+0080-U+07FF)
+            if (i+1 < (int)len && (text[i+1] & 0xC0) == 0x80) {
+                // 过滤所有2字节字符（包括拉丁扩展等）
+                i += 2;
             } else {
-                i++; // 跳过无效序列
+                // 不完整序列，跳过
+                i++;
             }
-        } else if ((c & 0xF0) == 0xE0) {
-            // 3字节UTF-8字符（主要是中文等）
-            if ((i + 2 < len) && ((text[i+1] & 0xC0) == 0x80) && ((text[i+2] & 0xC0) == 0x80)) {
-                unsigned char c2 = text[i+1];
-                unsigned char c3 = text[i+2];
-                
-                // 检查是否在GB2312支持的中文字符范围内
-                // GB2312中文字符范围:
-                // 一级汉字: U+4E00 to U+9FFF 
-                // 二级汉字: U+3400 to U+4DFF
-                // 其他兼容字符
-                int is_valid_gb2312 = 0;
-                
-                // 一级汉字区 (常用汉字)
-                if ((c == 0xE4 && c2 >= 0xB8 && c2 <= 0xBF) ||
-                    (c == 0xE5 && c2 >= 0x80 && c2 <= 0xBF) ||
-                    (c == 0xE6 && c2 >= 0x80 && c2 <= 0xBF) ||
-                    (c == 0xE7 && c2 >= 0x80 && c2 <= 0xBF) ||
-                    (c == 0xE8 && c2 >= 0x80 && c2 <= 0xBF) ||
-                    (c == 0xE9 && c2 >= 0x80 && c2 <= 0xBF)) {
-                    is_valid_gb2312 = 1;
-                }
-                // 二级汉字区和其他兼容汉字
-                else if ((c == 0xE3 && c2 >= 0x90 && c2 <= 0x9F) ||
-                         (c == 0xE4 && c2 >= 0x90 && c2 <= 0xB7)) {
-                    is_valid_gb2312 = 1;
-                }
-                
-                if (is_valid_gb2312) {
-                    // 保留有效的中文字符
-                    text[j++] = text[i++];
-                    text[j++] = text[i++];
-                    text[j++] = text[i++];
+            continue;
+        } else if ((c & 0xF0) == 0xE0) {  // 3字节字符 (U+0800-U+FFFF)
+            if (i+2 < (int)len && (text[i+1] & 0xC0) == 0x80 && (text[i+2] & 0xC0) == 0x80) {
+                // 保留常用中文字符和标点:
+                // 中日韩统一汉字 (U+4E00-U+9FFF) 对应UTF-8: 0xE4 0xB8 0x80 - 0xE9 0xBF BF
+                // CJK符号和标点 (U+3000-U+303F) 对应UTF-8: 0xE3 0x80 0x80 - 0xE3 0x80 0xBF
+                // 全角ASCII字符 (U+FF00-U+FFEF) 对应UTF-8: 0xEF 0xBC 0x80 - 0xEF 0xBF 0xAF
+                if ((c == 0xE4 && (unsigned char)text[i+1] >= 0xB8 && (unsigned char)text[i+1] <= 0xBF) ||
+                    (c == 0xE5 || c == 0xE6 || c == 0xE7 || c == 0xE8 || c == 0xE9) ||
+                    (c == 0xE3 && (unsigned char)text[i+1] == 0x80) ||
+                    (c == 0xEF && (unsigned char)text[i+1] >= 0xBC && (unsigned char)text[i+1] <= 0xBF)) {
+                    filtered_text[j++] = c;
+                    filtered_text[j++] = text[i+1];
+                    filtered_text[j++] = text[i+2];
+                    i += 3;
                 } else {
-                    // 跳过不符合GB2312范围的字符（如希腊文、阿拉伯文等）
+                    // 过滤其他3字节字符（替换为空）
                     i += 3;
                 }
             } else {
-                i++; // 跳过无效序列
+                // 不完整序列，跳过
+                i++;
             }
-        } else if ((c & 0xF8) == 0xF0) {
-            // 4字节UTF-8字符（CJK扩展B区等）
-            // GB2312不包含4字节字符，直接跳过
-            if ((i + 3 < len) && ((text[i+1] & 0xC0) == 0x80) && 
-                ((text[i+2] & 0xC0) == 0x80) && ((text[i+3] & 0xC0) == 0x80)) {
-                // 跳过4字节字符
+            continue;
+        } else if ((c & 0xF8) == 0xF0) {  // 4字节字符 (U+10000-U+10FFFF)
+            // 过滤所有4字节字符（替换为空）
+            if (i+3 < (int)len && (text[i+1] & 0xC0) == 0x80 && 
+                (text[i+2] & 0xC0) == 0x80 && (text[i+3] & 0xC0) == 0x80) {
                 i += 4;
             } else {
-                i++; // 跳过无效序列
+                // 不完整序列，跳过
+                i++;
             }
-        } else {
-            i++; // 跳过其他无效字节
+            continue;
         }
+        
+        // 其他字符跳过（替换为空）
+        i++;
     }
-    text[j] = '\0';
+    filtered_text[j] = '\0';
+    
+    // 调整内存大小以适应实际需要
+    char *result = (char*)realloc(filtered_text, j + 1);
+    return result ? result : filtered_text; // 如果realloc失败，返回原始分配的内存
 }
 
 // 获取SIM卡号函数
@@ -1076,7 +1025,7 @@ int can_reassemble_long_sms(const char *sender, const char *timestamp, unsigned 
     return (count == max); // 所有片段都已收到
 }
 
-// 重组长短信，按照接收顺序的逆序进行拼接（最先接收到的片段放在最后）
+// 重组长短信，按照接收顺序进行拼接（正序）
 int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char ref, unsigned char max, char *output, size_t output_size, char *combined_pdu, size_t pdu_size) {
     // 验证参数
     if (max == 0 || max > 255) {
@@ -1084,12 +1033,13 @@ int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char
         return 0;
     }
     
-    // 创建数组存储找到的片段索引，按队列中的存储顺序保存
+    // 创建数组存储找到的片段索引，按接收顺序保存
     int fragment_indices[LONG_SMS_FRAGMENT_QUEUE_SIZE];
+    int fragment_seq_map[LONG_SMS_FRAGMENT_QUEUE_SIZE]; // 存储对应的序号
     int fragment_count = 0;
     int i;
     
-    // 收集所有属于当前长短信的片段，按队列中的存储顺序保存索引
+    // 收集所有属于当前长短信的片段，按接收顺序保存索引
     for (i = 0; i < long_sms_fragment_count; i++) {
         int idx = (long_sms_fragment_head + i) % LONG_SMS_FRAGMENT_QUEUE_SIZE;
         if (strcmp(long_sms_fragment_queue[idx].sender, sender) == 0 &&
@@ -1100,6 +1050,7 @@ int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char
             unsigned char seq = long_sms_fragment_queue[idx].seq;
             if (seq >= 1 && seq <= max) {
                 fragment_indices[fragment_count] = idx;
+                fragment_seq_map[fragment_count] = seq;
                 fragment_count++;
             } else {
                 printf("[DEBUG] Invalid fragment sequence number: %d (max: %d)\n", seq, max);
@@ -1113,12 +1064,34 @@ int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char
         return 0; // 片段数量不匹配
     }
     
-    // 重组文本，按队列存储顺序的逆序进行拼接（最先存储的片段放在最后）
+    // 按照片段序号重新排序索引（正序组装）
+    // 使用选择排序按序号排序
+    for (i = 0; i < fragment_count - 1; i++) {
+        int min_idx = i;
+        int j;
+        for (j = i + 1; j < fragment_count; j++) {
+            if (fragment_seq_map[j] < fragment_seq_map[min_idx]) {
+                min_idx = j;
+            }
+        }
+        // 交换索引和序号
+        if (min_idx != i) {
+            int temp_idx = fragment_indices[i];
+            fragment_indices[i] = fragment_indices[min_idx];
+            fragment_indices[min_idx] = temp_idx;
+            
+            int temp_seq = fragment_seq_map[i];
+            fragment_seq_map[i] = fragment_seq_map[min_idx];
+            fragment_seq_map[min_idx] = temp_seq;
+        }
+    }
+    
+    // 重组文本，按序号顺序进行拼接（正序处理）
     output[0] = '\0';
     size_t current_len = 0;
     
-    // 从最后存储的片段开始向前拼接（逆序处理）
-    for (i = fragment_count - 1; i >= 0; i--) {
+    // 按序号顺序拼接（1, 2, 3, ...）
+    for (i = 0; i < fragment_count; i++) {
         int idx = fragment_indices[i];
         size_t fragment_len = strlen(long_sms_fragment_queue[idx].text);
         if (current_len + fragment_len < output_size - 1) {
@@ -1130,13 +1103,10 @@ int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char
         }
     }
     
-    // 过滤乱码字符
-    filter_garbage_chars(output);
-    
-    // 组合所有PDU片段，也按队列存储顺序的逆序
+    // 组合所有PDU片段，也按序号顺序
     combined_pdu[0] = '\0';
     size_t pdu_len = 0;
-    for (i = fragment_count - 1; i >= 0; i--) {
+    for (i = 0; i < fragment_count; i++) {
         int idx = fragment_indices[i];
         size_t pdu_fragment_len = strlen(long_sms_fragment_queue[idx].pdu);
         if (pdu_len + pdu_fragment_len < pdu_size - 1) {
@@ -1148,7 +1118,7 @@ int reassemble_long_sms(const char *sender, const char *timestamp, unsigned char
         }
     }
     
-    printf("[DEBUG] Successfully reassembled long SMS with %d fragments in reverse queue order\n", max);
+    printf("[DEBUG] Successfully reassembled long SMS with %d fragments in normal order\n", max);
     return 1; // 重组成功
 }
 
@@ -1591,8 +1561,6 @@ void decode_7bit_pdu(const char *pdu_data, int data_len_oct, char *output, size_
     output[out_idx] = '\0';
     free(binary_data);
     
-    // 过滤乱码字符
-    filter_garbage_chars(output);
 }
 
 // 完整的PDU解码，包含SMSC、发件人、时间戳等信息
@@ -1849,9 +1817,6 @@ void decode_pdu_ucs2(const char *pdu, char *out, size_t outlen) {
         i += 4;
     }
     out[j] = 0;
-    
-    // 过滤乱码字符
-    filter_garbage_chars(out);
 }
 
 // 发送钉钉消息接口（只支持text）
@@ -2086,8 +2051,12 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                             combined_pdu);
                     }
                     
-                    send_dingtalk_msg(webhook, full_msg, keyword);
-                    
+                    // 过滤垃圾字符
+                    char *filtered_msg = filter_garbage_chars(full_msg);
+                    printf("[DEBUG] After filtering: %s\n", filtered_msg);
+                    send_dingtalk_msg(webhook, filtered_msg , keyword);
+                    free(filtered_msg); // 释放filter_garbage_chars分配的内存
+
                     // 使用truncate强制清空文件（0字节填充）
                     if (truncate("/tmp/zte_log.txt", 0) != 0) {
                         perror("truncate /tmp/zte_log.txt");
@@ -2247,10 +2216,12 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                                 
                                 // 如果未发送过，则发送并添加到已发送队列
                                 if (!already_sent) {
+
                                     // 处理PDU，显示解码后的信息和原始PDU
+                                    
                                     snprintf(decoded_info, sizeof(decoded_info),
                                         "短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
-                                        info.smsc[0] ? info.smsc : "N/A",
+                                        // info.smsc[0] ? info.smsc : "N/A",
                                         info.sender[0] ? info.sender : "N/A",
                                         info.timestamp[0] ? info.timestamp : "N/A",
                                         info.text);
@@ -2300,8 +2271,12 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                                             pdu_trim);
                                     }
                                     
-                                    send_dingtalk_msg(webhook, full_msg, keyword);
-                                    
+                                    // 过滤垃圾字符
+                                    char *filtered_msg = filter_garbage_chars(full_msg);
+                                    printf("[DEBUG] After filtering: %s\n", filtered_msg);
+                                    send_dingtalk_msg(webhook, filtered_msg, keyword);
+                                    free(filtered_msg); // 释放filter_garbage_chars分配的内存
+
                                     // 使用truncate强制清空文件（0字节填充）
                                     if (truncate("/tmp/zte_log.txt", 0) != 0) {
                                         perror("truncate /tmp/zte_log.txt");
