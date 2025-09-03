@@ -131,8 +131,8 @@ static char strace_bin_path[256] = "/sbin/strace";
 
 // 添加用于动态调整重启间隔的变量
 static time_t last_sms_detected_time = 0;       // 上次检测到短信的时间
-static const int BASE_RESTART_INTERVAL = 30;    // 基础重启间隔(秒)
-static const int MAX_RESTART_INTERVAL = 60;     // 最大重启间隔(秒)
+static const int BASE_RESTART_INTERVAL = 60;    // 基础重启间隔(秒)
+static const int MAX_RESTART_INTERVAL = 180;     // 最大重启间隔(秒)
 static const int INTERVAL_EXTENSION = 5;        // 每次检测到短信时的延长时间(秒)
 
 // 替换原有的filter_garbage_chars函数为以下版本：
@@ -396,7 +396,7 @@ void cleanup_long_sms_tracker() {
     }
 }
 
-// 修改strace_thread_func函数，添加更精确的重启前短信接收检查
+// 修改strace_thread_func函数中的重启周期相关常量和逻辑
 void* strace_thread_func(void* arg) {
     char* webhook = (char*)arg;
     
@@ -419,6 +419,11 @@ void* strace_thread_func(void* arg) {
             const long MAX_LOG_SIZE = 1 * 512 * 1024; // 0.5MB
             int check_count = 0;
             time_t last_restart_time = time(NULL);
+            
+            // 修改默认重启周期为1分钟，最大周期为5分钟
+            const int BASE_RESTART_INTERVAL = 60;    // 基础重启间隔(1分钟)
+            const int MAX_RESTART_INTERVAL = 300;    // 最大重启间隔(5分钟)
+            const int INTERVAL_EXTENSION = 10;       // 检测到短信时的延长时间(10秒)
             
             while (threads_running) {
                 check_count++;
@@ -469,9 +474,9 @@ void* strace_thread_func(void* arg) {
                     }
                     
                     if (should_delay_restart) {
-                        // 如果检测到匹配的短信，延迟5秒再检查
-                        printf("检测到正在接收匹配的短信(write(1, ...))，延迟5秒重启strace进程...\n");
-                        sleep(5);
+                        // 如果检测到匹配的短信，延迟10秒再检查
+                        printf("检测到正在接收匹配的短信(write(1, ...))，延迟10秒重启strace进程...\n");
+                        sleep(10);
                         
                         // 再次检查是否仍在接收短信
                         int still_receiving = 0;
@@ -492,8 +497,8 @@ void* strace_thread_func(void* arg) {
                         }
                         
                         if (still_receiving) {
-                            printf("仍在接收匹配的短信，再延迟5秒重启strace进程...\n");
-                            sleep(5);
+                            printf("仍在接收匹配的短信，再延迟10秒重启strace进程...\n");
+                            sleep(10);
                         }
                     }
                     
@@ -2038,18 +2043,18 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                         }
                     }
                     
-                    if (headtxt_with_number[0]) {
-                        snprintf(full_msg, sizeof(full_msg),
-                            "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                            headtxt_with_number,
-                            decoded_info,
-                            combined_pdu);
-                    } else {
-                        snprintf(full_msg, sizeof(full_msg),
-                            "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                            decoded_info,
-                            combined_pdu);
-                    }
+                    // if (headtxt_with_number[0]) {
+                    //     snprintf(full_msg, sizeof(full_msg),
+                    //         "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
+                    //         headtxt_with_number,
+                    //         decoded_info,
+                    //         combined_pdu);
+                    // } else {
+                    //     snprintf(full_msg, sizeof(full_msg),
+                    //         "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
+                    //         decoded_info,
+                    //         combined_pdu);
+                    // }
                     
                     // 过滤垃圾字符
                     char *filtered_msg = filter_garbage_chars(full_msg);
@@ -2258,18 +2263,18 @@ void extract_and_send_sms_from_log(const char *webhook, const char *headtxt, con
                                         }
                                     }
                                     
-                                    if (headtxt_with_number[0]) {
-                                        snprintf(full_msg, sizeof(full_msg),
-                                            "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                                            headtxt_with_number,
-                                            decoded_info,
-                                            pdu_trim);
-                                    } else {
-                                        snprintf(full_msg, sizeof(full_msg),
-                                            "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
-                                            decoded_info,
-                                            pdu_trim);
-                                    }
+                                    // if (headtxt_with_number[0]) {
+                                    //     snprintf(full_msg, sizeof(full_msg),
+                                    //         "%s\n[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
+                                    //         headtxt_with_number,
+                                    //         decoded_info,
+                                    //         pdu_trim);
+                                    // } else {
+                                    //     snprintf(full_msg, sizeof(full_msg),
+                                    //         "[pdu解码后的信息]\n%s\n\n原始PDU十六进制码如下(受限字符集，可能会有乱码，如有影响阅读自行解码原始数据)：\n%s",
+                                    //         decoded_info,
+                                    //         pdu_trim);
+                                    // }
                                     
                                     // 过滤垃圾字符
                                     char *filtered_msg = filter_garbage_chars(full_msg);
