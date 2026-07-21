@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <limits.h>
 #include "alice-pusher-bot.h"
 #include "../.build/avatar_asset.h"
@@ -25,16 +26,32 @@
 #define DEFAULT_SERVICE_PID "/tmp/alice_pusher_service.pid"
 #define DEFAULT_LOG_PATH "/tmp/alice_pusher.log"
 #define DEFAULT_LOG_LOCK_PATH "/tmp/alice_pusher.log.lock"
-#define DEFAULT_RUN_PATH "/mnt/userdata/alice-pusher-bot.run"
-#define DEFAULT_BIN_PATH "/mnt/userdata/alice-pusher-bot"
-#define DEFAULT_AUTOSTART_SCRIPT "/mnt/userdata/alice_pusher_autostart.sh"
-#define DEFAULT_AUTOSTART_RC "/etc/rc"
-#define AUTOSTART_BEGIN "# alice-pusher-bot autostart begin"
-#define AUTOSTART_END "# alice-pusher-bot autostart end"
-#define WEB_BODY_MAX 262144
+#define USERDATA_DIR "/mnt/userdata"
+#define WONDER_DIR USERDATA_DIR "/alice_rescue"
+#define WONDER_RUN_PATH WONDER_DIR "/alice-rc.run"
+#define WONDER_MANIFEST_PATH WONDER_DIR "/manifest"
+#define WONDER_GLOBAL_PATH WONDER_DIR "/global.sh"
+#define WONDER_AUTOSTART_MAIN USERDATA_DIR "/alice_wonder_autostart.sh"
+#define WONDER_SYSTEM_STARTUP WONDER_DIR "/system_startup.sh"
+#define WONDER_PUSHER_SCRIPT WONDER_DIR "/autostart/alice-pusher-bot.sh"
+#define PUSHER_DIR USERDATA_DIR "/alice_pusher"
+#define PUSHER_RUN_PATH PUSHER_DIR "/alice-pusher-bot.run"
+#define PUSHER_BIN_PATH PUSHER_DIR "/alice-pusher-bot"
+#define PUSHER_GLOBAL_PATH PUSHER_DIR "/global.sh"
+#define PUSHER_MANIFEST_PATH PUSHER_DIR "/manifest"
+#define PUSHER_START_LOG "/tmp/alice_pusher_autostart.out"
+#define PUSHER_START_MARKER "/tmp/alice_pusher_autostart.started"
+#define PUSHER_PATH_SH_MARKER "/tmp/alice_pusher_path_sh_started"
+#define PUSHER_AUTOSTART_BEGIN "# alice-pusher-bot path_sh begin"
+#define PUSHER_AUTOSTART_END "# alice-pusher-bot path_sh end"
+#define PERSIST_RESERVE_BYTES (16UL * 1024UL)
+#define LEGACY_RUN_PATH USERDATA_DIR "/alice-pusher-bot.run"
+#define LEGACY_BIN_PATH USERDATA_DIR "/alice-pusher-bot"
+#define LEGACY_AUTOSTART_SCRIPT USERDATA_DIR "/alice_pusher_autostart.sh"
+#define WEB_BODY_MAX 65536
 #define WEB_REQ_MAX 16384
-#define LOG_RING_MAX 65536
-#define LOG_TAIL_MAX 32768
+#define LOG_RING_MAX 1024
+#define LOG_TAIL_MAX LOG_RING_MAX
 #define LOG_EXPORT_NAME "alice_pusher.log"
 #define TARGET_MIFI_PATH ALICE_TARGET_MIFI_PATH
 #define TARGET_UFI_PATH ALICE_TARGET_UFI_PATH
@@ -62,11 +79,22 @@ typedef struct {
 } web_config_t;
 
 typedef struct {
-    int run_ready;
-    int bin_ready;
+    int wonder_detected;
+    int payload_ready;
     int script_ready;
-    int hook_ready;
+    int entry_ready;
+    int installed;
+    int startup_running;
+    int mode;
+    unsigned long free_bytes;
+    unsigned long required_bytes;
+    char mode_label[64];
+    char payload_path[256];
+    char script_path[256];
+    char error[256];
 } autostart_status_t;
+
+static char g_autostart_error[256];
 
 static void safe_copy(char *dst, size_t dstsz, const char *src) {
     if (!dstsz) return;
@@ -89,6 +117,12 @@ static const char *platform_label(const char *platform) {
     if (strcmp(platform, "bark") == 0) return "Bark";
     if (strcmp(platform, "custom") == 0) return "自定义";
     return "钉钉";
+}
+
+static const char *configured_platform_label(const web_config_t *cfg) {
+    if (!cfg || !cfg->webhook[0])
+        return "未配置";
+    return platform_label(cfg->platform);
 }
 
 static const char *normalize_target_mode(const char *mode) {
@@ -392,218 +426,387 @@ static int current_exe_path(char *out, size_t outsz) {
     return 0;
 }
 
-static void get_autostart_status(autostart_status_t *st) {
-    memset(st, 0, sizeof(*st));
-    st->run_ready = access(DEFAULT_RUN_PATH, R_OK) == 0;
-    st->bin_ready = access(DEFAULT_BIN_PATH, X_OK) == 0;
-    st->script_ready = access(DEFAULT_AUTOSTART_SCRIPT, R_OK) == 0;
-    st->hook_ready = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN) &&
-                     file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_END);
-}
-
 static void remount_userdata_rw(void) {
-    system("mount -o remount,rw,exec /mnt/userdata 2>/dev/null || "
-           "mount -o remount,rw /mnt/userdata 2>/dev/null");
+    system("mount -o remount,rw,exec " USERDATA_DIR " 2>/dev/null || "
+           "mount -o remount,rw " USERDATA_DIR " 2>/dev/null");
 }
 
-static void remount_root_rw(void) {
-    system("mount -o remount,rw / 2>/dev/null; "
-           "mount -o remount,rw /dev/root / 2>/dev/null");
+enum {
+    PERSIST_NONE = 0,
+    PERSIST_WONDER = 1,
+    PERSIST_STANDALONE = 2
+};
+
+static void set_autostart_error(const char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(g_autostart_error, sizeof(g_autostart_error), fmt, ap);
+    va_end(ap);
 }
 
-static void remount_root_ro(void) {
-    system("sync; mount -o remount,ro / 2>/dev/null; "
-           "mount -o remount,ro /dev/root / 2>/dev/null");
-}
-
-static int install_autostart_payload(int *payload_kind) {
-    const char *run_src;
-    char exe[PATH_MAX];
-    int run_errno = 0;
-
-    if (payload_kind) *payload_kind = 0;
-    remount_userdata_rw();
-
-    run_src = getenv("ALICE_PUSHER_RUN_SOURCE");
-    if (path_is_regular_readable(run_src)) {
-        if (copy_regular_file(run_src, DEFAULT_RUN_PATH, 0755) == 0) {
-            if (payload_kind) *payload_kind = 1;
-            sync();
-            return 0;
-        }
-        run_errno = errno;
-    }
-
-    if (current_exe_path(exe, sizeof(exe)) == 0 &&
-        path_is_regular_readable(exe)) {
-        if (copy_regular_file(exe, DEFAULT_BIN_PATH, 0755) == 0) {
-            if (payload_kind) *payload_kind = 2;
-            sync();
-            return 0;
-        }
-    }
-
-    if (run_errno)
-        errno = run_errno;
-    return -1;
-}
-
-static void write_autostart_exec_block(FILE *fp, const char *var,
-                                       int use_shell) {
-    fprintf(fp, "if [ %s \"$%s\" ]; then\n", use_shell ? "-r" : "-x", var);
-    fprintf(fp, "\texec ");
-    if (use_shell)
-        fprintf(fp, "/bin/sh ");
-    fprintf(fp, "\"$%s\" -w\n", var);
-    fprintf(fp, "fi\n");
-}
-
-static int write_autostart_script(void) {
-    int fd;
-    int payload_kind = 0;
+static int read_nv_path_sh(char *out, size_t outsz) {
     FILE *fp;
+    size_t len;
 
-    if (install_autostart_payload(&payload_kind) < 0)
-        return -1;
-    if (mkdir_parent_file(DEFAULT_AUTOSTART_SCRIPT) < 0)
-        return -1;
-    fd = open(DEFAULT_AUTOSTART_SCRIPT,
-              O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    if (fd < 0)
-        return -1;
-    fp = fdopen(fd, "w");
-    if (!fp) {
-        close(fd);
+    if (!out || outsz == 0) return -1;
+    out[0] = 0;
+    fp = popen("nv get path_sh 2>/dev/null", "r");
+    if (!fp) return -1;
+    if (!fgets(out, (int)outsz, fp)) {
+        pclose(fp);
         return -1;
     }
-
-    fprintf(fp, "#!/bin/sh\n");
-    fprintf(fp, "# generated by alice-pusher-bot\n");
-    fprintf(fp, "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n");
-    fprintf(fp, "mount -o remount,exec /tmp 2>/dev/null || true\n");
-    fprintf(fp, "mount -o remount,rw,exec /mnt/userdata 2>/dev/null || mount -o remount,rw /mnt/userdata 2>/dev/null || true\n");
-    fprintf(fp, "RUN=");
-    shell_quote(fp, DEFAULT_RUN_PATH);
-    fprintf(fp, "\nBIN=");
-    shell_quote(fp, DEFAULT_BIN_PATH);
-    fprintf(fp, "\n");
-    if (payload_kind == 2) {
-        write_autostart_exec_block(fp, "BIN", 0);
-        write_autostart_exec_block(fp, "RUN", 1);
-    } else {
-        write_autostart_exec_block(fp, "RUN", 1);
-        write_autostart_exec_block(fp, "BIN", 0);
-    }
-    fprintf(fp, "echo \"missing alice-pusher-bot startup payload\" >&2\n");
-    fprintf(fp, "exit 127\n");
-    if (fclose(fp) != 0)
-        return -1;
-    return chmod(DEFAULT_AUTOSTART_SCRIPT, 0755);
+    pclose(fp);
+    len = strcspn(out, "\r\n \t");
+    out[len] = 0;
+    return out[0] ? 0 : -1;
 }
 
-static int install_autostart_hook(void) {
-    FILE *fp;
-    int has_begin = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN);
-    int has_end = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_END);
+static int wonder_deployed(void) {
+    char path_sh[256];
 
-    if (has_begin && has_end)
+    if (read_nv_path_sh(path_sh, sizeof(path_sh)) < 0 ||
+        strcmp(path_sh, WONDER_DIR) != 0)
         return 0;
-    if (has_begin || has_end) {
-        errno = EINVAL;
-        return -1;
-    }
+    return access(WONDER_DIR, X_OK) == 0 &&
+           path_is_regular_readable(WONDER_RUN_PATH) &&
+           path_is_regular_readable(WONDER_GLOBAL_PATH) &&
+           path_is_regular_readable(WONDER_AUTOSTART_MAIN) &&
+           path_is_regular_readable(WONDER_SYSTEM_STARTUP) &&
+           file_contains(WONDER_MANIFEST_PATH, "name=alice-wonder") &&
+           file_contains(WONDER_GLOBAL_PATH, "alice-wonder path_sh begin");
+}
 
-    remount_root_rw();
-    fp = fopen(DEFAULT_AUTOSTART_RC, "a");
-    if (!fp) {
-        remount_root_ro();
-        return -1;
-    }
-    fprintf(fp, "\n%s\n", AUTOSTART_BEGIN);
-    fprintf(fp, "if [ -f %s ]; then\n", DEFAULT_AUTOSTART_SCRIPT);
-    fprintf(fp, "\t/bin/sh %s >/tmp/alice_pusher_autostart.out 2>/tmp/alice_pusher_autostart.err &\n",
-            DEFAULT_AUTOSTART_SCRIPT);
-    fprintf(fp, "fi\n");
-    fprintf(fp, "%s\n", AUTOSTART_END);
-    if (fclose(fp) != 0) {
-        remount_root_ro();
-        return -1;
-    }
-    sync();
-    remount_root_ro();
+static int standalone_entry_ready(void) {
+    char path_sh[256];
+
+    if (read_nv_path_sh(path_sh, sizeof(path_sh)) < 0 ||
+        strcmp(path_sh, PUSHER_DIR) != 0)
+        return 0;
+    return path_is_regular_readable(PUSHER_GLOBAL_PATH) &&
+           file_contains(PUSHER_GLOBAL_PATH, PUSHER_AUTOSTART_BEGIN) &&
+           file_contains(PUSHER_GLOBAL_PATH, ". /sbin/global.sh");
+}
+
+static int persistence_mode(void) {
+    if (wonder_deployed()) return PERSIST_WONDER;
+    if (standalone_entry_ready()) return PERSIST_STANDALONE;
+    return PERSIST_NONE;
+}
+
+static const char *persistence_mode_label(int mode) {
+    if (mode == PERSIST_WONDER) return "Wonder 集成模式";
+    if (mode == PERSIST_STANDALONE) return "独立 path_sh 模式";
+    return "未安装";
+}
+
+static int userdata_free_bytes(unsigned long *out) {
+    struct statvfs st;
+    unsigned long long bytes;
+
+    if (!out || statvfs(USERDATA_DIR, &st) < 0) return -1;
+    bytes = (unsigned long long)st.f_bavail * (unsigned long long)st.f_frsize;
+    *out = bytes > ULONG_MAX ? ULONG_MAX : (unsigned long)bytes;
     return 0;
 }
 
-static int remove_autostart_hook(void) {
-    char *buf;
-    char *begin;
-    char *end;
-    char tmp_path[] = DEFAULT_AUTOSTART_RC ".alice_pusher_tmp";
-    struct stat st;
-    size_t len;
-    int fd;
-    int rc = -1;
+static int choose_payload_source(char *out, size_t outsz) {
+    const char *run_src = getenv("ALICE_PUSHER_RUN_SOURCE");
 
-    buf = read_file_alloc(DEFAULT_AUTOSTART_RC, 128 * 1024, &len);
-    if (!buf)
-        return file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN) ? -1 : 0;
-    begin = strstr(buf, AUTOSTART_BEGIN);
-    if (!begin) {
-        free(buf);
-        return 0;
+    if (path_is_regular_readable(run_src)) {
+        safe_copy(out, outsz, run_src);
+        return 1;
     }
-    end = strstr(begin, AUTOSTART_END);
-    if (!end) {
-        free(buf);
-        errno = EINVAL;
+    if (current_exe_path(out, outsz) == 0 &&
+        path_is_regular_readable(out))
+        return 2;
+    errno = ENOENT;
+    return 0;
+}
+
+static unsigned long file_size_or_zero(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) < 0 || st.st_size < 0)
+        return 0;
+    return (unsigned long)st.st_size;
+}
+
+static int payload_space_ok(const char *source, unsigned long *free_out,
+                            unsigned long *required_out) {
+    unsigned long free_bytes = 0;
+    unsigned long source_size = file_size_or_zero(source);
+    unsigned long existing_size = file_size_or_zero(PUSHER_RUN_PATH);
+    unsigned long required;
+
+    if (!source_size || userdata_free_bytes(&free_bytes) < 0) {
+        set_autostart_error("无法读取 Pushbot payload 或 userdata 可用空间。 ");
+        errno = EIO;
         return -1;
     }
-    if (begin > buf && begin[-1] == '\n')
-        begin--;
-    end += strlen(AUTOSTART_END);
-    if (*end == '\r') end++;
-    if (*end == '\n') end++;
+    required = source_size + PERSIST_RESERVE_BYTES;
+    if (free_out) *free_out = free_bytes;
+    if (required_out) *required_out = required;
+    if (free_bytes + existing_size < required) {
+        set_autostart_error("userdata 空间不足：需要约 %lu KB，可用约 %lu KB。",
+                            (required + 1023UL) / 1024UL,
+                            (free_bytes + 1023UL) / 1024UL);
+        errno = ENOSPC;
+        return -1;
+    }
+    return 0;
+}
 
-    remount_root_rw();
-    fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0744);
-    if (fd < 0) goto out;
-    if (write_all_fd(fd, buf, (size_t)(begin - buf)) < 0) goto out_close;
-    if (write_all_fd(fd, end, len - (size_t)(end - buf)) < 0) goto out_close;
+static int write_text_file(const char *path, const char *text, mode_t mode) {
+    char tmp[PATH_MAX];
+    int fd;
+    int saved_errno;
+    int rc = -1;
+
+    if (mkdir_parent_file(path) < 0) return -1;
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()) >=
+        (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    if (write_all_fd(fd, text, strlen(text)) < 0) goto out;
+    if (fsync(fd) < 0) goto out;
     if (close(fd) < 0) {
         fd = -1;
         goto out;
     }
     fd = -1;
-    if (stat(DEFAULT_AUTOSTART_RC, &st) == 0)
-        chmod(tmp_path, st.st_mode & 0777);
-    if (rename(tmp_path, DEFAULT_AUTOSTART_RC) < 0) goto out;
-    sync();
+    if (chmod(tmp, mode) < 0 || rename(tmp, path) < 0)
+        goto out;
     rc = 0;
-    goto out;
 
-out_close:
-    close(fd);
-    fd = -1;
 out:
+    saved_errno = errno;
     if (fd >= 0) close(fd);
-    unlink(tmp_path);
-    remount_root_ro();
-    free(buf);
+    if (rc < 0) unlink(tmp);
+    errno = saved_errno;
     return rc;
 }
 
-static int disable_autostart(int *hook_remove_failed) {
-    int rc = 0;
+static int install_autostart_payload(int *payload_kind) {
+    char source[PATH_MAX];
+    int source_kind;
 
-    if (hook_remove_failed) *hook_remove_failed = 0;
-    remount_userdata_rw();
-    if (unlink(DEFAULT_AUTOSTART_SCRIPT) < 0 && errno != ENOENT)
-        rc = -1;
-    if (remove_autostart_hook() < 0) {
-        rc = -1;
-        if (hook_remove_failed) *hook_remove_failed = 1;
+    if (payload_kind) *payload_kind = 0;
+    source_kind = choose_payload_source(source, sizeof(source));
+    if (!source_kind) {
+        set_autostart_error("找不到当前 Pushbot 运行包。 ");
+        return -1;
     }
+    if (payload_space_ok(source, NULL, NULL) < 0)
+        return -1;
+    remount_userdata_rw();
+    if (source_kind == 1) {
+        if (copy_regular_file(source, PUSHER_RUN_PATH, 0755) < 0) {
+            set_autostart_error("写入 Pushbot .run payload 失败：errno=%d。", errno);
+            return -1;
+        }
+        unlink(PUSHER_BIN_PATH);
+        if (payload_kind) *payload_kind = 1;
+    } else {
+        if (copy_regular_file(source, PUSHER_BIN_PATH, 0755) < 0) {
+            set_autostart_error("写入 Pushbot 二进制 payload 失败：errno=%d。", errno);
+            return -1;
+        }
+        unlink(PUSHER_RUN_PATH);
+        if (payload_kind) *payload_kind = 2;
+    }
+    sync();
+    return 0;
+}
+
+static int write_wonder_startup_script(int port) {
+    char script[4096];
+
+    snprintf(script, sizeof(script),
+        "#!/bin/sh\n"
+        "# generated by alice-pusher-bot-wonder\n"
+        "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n"
+        "trap '' HUP\n"
+        "mount -o remount,exec /tmp 2>/dev/null || true\n"
+        "RUN='%s'\n"
+        "LOG='%s'\n"
+        "trim_log() {\n"
+        "    [ -f \"$1\" ] || return 0\n"
+        "    size=$(wc -c < \"$1\" 2>/dev/null || echo 0)\n"
+        "    [ \"$size\" -le 1024 ] && return 0\n"
+        "    tmp=\"$1.trim\"\n"
+        "    tail -c 1024 \"$1\" > \"$tmp\" 2>/dev/null || { rm -f \"$tmp\"; return 0; }\n"
+        "    cat \"$tmp\" > \"$1\" 2>/dev/null || true\n"
+        "    rm -f \"$tmp\"\n"
+        "}\n"
+        "trim_log \"$LOG\"\n"
+        "if ! mkdir /tmp/alice_pusher_wonder_started 2>/dev/null; then\n"
+        "    exit 0\n"
+        "fi\n"
+        "if [ -r \"$RUN\" ]; then\n"
+        "    echo \"event=starting mode=wonder port=%d\" >> \"$LOG\"\n"
+        "    ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh \"$RUN\" -w -L %d >> \"$LOG\" 2>&1 &\n"
+        "    echo \"event=started pid=$!\" >> \"$LOG\"\n"
+        "    trim_log \"$LOG\"\n"
+        "else\n"
+        "    echo \"event=missing_payload path=$RUN\" >> \"$LOG\"\n"
+        "fi\n"
+        "exit 0\n",
+        PUSHER_RUN_PATH, PUSHER_START_LOG, port, port);
+    if (write_text_file(WONDER_PUSHER_SCRIPT, script, 0755) < 0) {
+        set_autostart_error("写入 Wonder 启动项失败：errno=%d。", errno);
+        return -1;
+    }
+    return 0;
+}
+
+static int write_standalone_path_sh(int port) {
+    char script[4096];
+
+    snprintf(script, sizeof(script),
+        "#!/bin/sh\n"
+        "%s\n"
+        "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n"
+        "trap '' HUP\n"
+        "mount -o remount,exec /tmp 2>/dev/null || true\n"
+        "trim_log() {\n"
+        "    [ -f \"$1\" ] || return 0\n"
+        "    size=$(wc -c < \"$1\" 2>/dev/null || echo 0)\n"
+        "    [ \"$size\" -le 1024 ] && return 0\n"
+        "    tmp=\"$1.trim\"\n"
+        "    tail -c 1024 \"$1\" > \"$tmp\" 2>/dev/null || { rm -f \"$tmp\"; return 0; }\n"
+        "    cat \"$tmp\" > \"$1\" 2>/dev/null || true\n"
+        "    rm -f \"$tmp\"\n"
+        "}\n"
+        "if mkdir '%s' 2>/dev/null; then\n"
+        "    RUN='%s'\n"
+        "    BIN='%s'\n"
+        "    if [ -r \"$RUN\" ]; then\n"
+        "        ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh \"$RUN\" -w -L %d >> '%s' 2>&1 &\n"
+        "    elif [ -x \"$BIN\" ]; then\n"
+        "        ALICE_PUSHER_AUTOSTART=1 \"$BIN\" -w -L %d >> '%s' 2>&1 &\n"
+        "    else\n"
+        "        echo \"missing alice-pusher-bot payload\" >> '%s'\n"
+        "    fi\n"
+        "fi\n"
+        "path_sh=/sbin\n"
+        ". /sbin/global.sh\n"
+        "path_sh=/sbin\n",
+        PUSHER_AUTOSTART_BEGIN, PUSHER_PATH_SH_MARKER,
+        PUSHER_RUN_PATH, PUSHER_BIN_PATH, port, PUSHER_START_LOG,
+        port, PUSHER_START_LOG, PUSHER_START_LOG,
+        PUSHER_AUTOSTART_END);
+    if (write_text_file(PUSHER_GLOBAL_PATH, script, 0755) < 0) {
+        set_autostart_error("写入 Pushbot path_sh wrapper 失败：errno=%d。", errno);
+        return -1;
+    }
+    if (system("nv set path_sh=" PUSHER_DIR " >/tmp/alice_pusher_nv.out 2>&1 && "
+               "nv save >>/tmp/alice_pusher_nv.out 2>&1") != 0) {
+        set_autostart_error("保存 Pushbot path_sh 入口失败。 ");
+        return -1;
+    }
+    return 0;
+}
+
+static int write_pusher_manifest(int mode, int payload_kind, int port) {
+    char manifest[1024];
+
+    snprintf(manifest, sizeof(manifest),
+             "name=alice-pusher-bot\nversion=2\nmode=%s\n"
+             "payload=%s\nstartup=%s\nport=%d\n",
+             mode == PERSIST_WONDER ? "wonder" : "standalone",
+             payload_kind == 1 ? PUSHER_RUN_PATH : PUSHER_BIN_PATH,
+             mode == PERSIST_WONDER ? WONDER_PUSHER_SCRIPT : PUSHER_GLOBAL_PATH,
+             port);
+    if (write_text_file(PUSHER_MANIFEST_PATH, manifest, 0644) < 0) {
+        set_autostart_error("写入 Pushbot manifest 失败：errno=%d。", errno);
+        return -1;
+    }
+    return 0;
+}
+
+static void get_autostart_status(autostart_status_t *st) {
+    char source[PATH_MAX];
+    unsigned long source_size = 0;
+    int source_kind;
+
+    memset(st, 0, sizeof(*st));
+    st->wonder_detected = wonder_deployed();
+    st->mode = persistence_mode();
+    st->payload_ready = access(PUSHER_RUN_PATH, R_OK) == 0 ||
+                        access(PUSHER_BIN_PATH, X_OK) == 0;
+    st->script_ready = st->mode == PERSIST_WONDER ?
+        path_is_regular_readable(WONDER_PUSHER_SCRIPT) &&
+        file_contains(WONDER_PUSHER_SCRIPT, "generated by alice-pusher-bot-wonder") :
+        st->mode == PERSIST_STANDALONE ? standalone_entry_ready() : 0;
+    st->entry_ready = st->mode == PERSIST_WONDER ?
+        st->wonder_detected && path_is_regular_readable(WONDER_SYSTEM_STARTUP) :
+        st->mode == PERSIST_STANDALONE ? standalone_entry_ready() : 0;
+    st->installed = st->payload_ready && st->script_ready && st->entry_ready;
+    st->startup_running = getenv("ALICE_PUSHER_AUTOSTART") &&
+                          strcmp(getenv("ALICE_PUSHER_AUTOSTART"), "1") == 0;
+    safe_copy(st->mode_label, sizeof(st->mode_label),
+              persistence_mode_label(st->mode));
+    if (st->payload_ready) {
+        safe_copy(st->payload_path, sizeof(st->payload_path),
+                  access(PUSHER_RUN_PATH, R_OK) == 0 ?
+                  PUSHER_RUN_PATH : PUSHER_BIN_PATH);
+    } else {
+        safe_copy(st->payload_path, sizeof(st->payload_path), "-");
+    }
+    safe_copy(st->script_path, sizeof(st->script_path),
+              st->mode == PERSIST_WONDER ? WONDER_PUSHER_SCRIPT :
+              st->mode == PERSIST_STANDALONE ? PUSHER_GLOBAL_PATH : "-");
+    source_kind = choose_payload_source(source, sizeof(source));
+    if (source_kind) source_size = file_size_or_zero(source);
+    st->required_bytes = source_size + PERSIST_RESERVE_BYTES;
+    userdata_free_bytes(&st->free_bytes);
+    safe_copy(st->error, sizeof(st->error), g_autostart_error);
+}
+
+static int disable_autostart(void) {
+    int rc = 0;
+    char path_sh[256];
+
+    remount_userdata_rw();
+    if (unlink(WONDER_PUSHER_SCRIPT) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(PUSHER_GLOBAL_PATH) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(PUSHER_RUN_PATH) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(PUSHER_BIN_PATH) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(PUSHER_MANIFEST_PATH) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(LEGACY_RUN_PATH) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(LEGACY_BIN_PATH) < 0 && errno != ENOENT) rc = -1;
+    if (unlink(LEGACY_AUTOSTART_SCRIPT) < 0 && errno != ENOENT) rc = -1;
+    if (read_nv_path_sh(path_sh, sizeof(path_sh)) == 0 &&
+        strcmp(path_sh, PUSHER_DIR) == 0 &&
+        system("nv set path_sh=/sbin >/tmp/alice_pusher_nv.out 2>&1 && "
+               "nv save >>/tmp/alice_pusher_nv.out 2>&1") != 0)
+        rc = -1;
+    sync();
     return rc;
+}
+
+static int install_persistent_autostart(const web_config_t *cfg) {
+    int mode = wonder_deployed() ? PERSIST_WONDER : PERSIST_STANDALONE;
+    int payload_kind = 0;
+    int port = cfg && cfg->port > 0 ? cfg->port : DEFAULT_WEBUI_PORT;
+
+    g_autostart_error[0] = 0;
+    if (install_autostart_payload(&payload_kind) < 0)
+        return -1;
+    if (mode == PERSIST_WONDER) {
+        if (write_wonder_startup_script(port) < 0)
+            return -1;
+    } else if (write_standalone_path_sh(port) < 0) {
+        return -1;
+    }
+    if (write_pusher_manifest(mode, payload_kind, port) < 0)
+        return -1;
+    sync();
+    return 0;
 }
 
 static void load_web_config(web_config_t *cfg) {
@@ -1332,11 +1535,11 @@ static void append_page_end(char *body, size_t bodysz) {
         "else{if(m){m.textContent='未从 nv show 读取到手机号，请手动填写或留空。';m.className='hint warn';}}"
         "}).catch(function(){if(m){m.textContent='读取失败，请检查设备是否支持 nv show。';m.className='hint warn';}})"
         ".finally(function(){if(b){b.disabled=false;b.textContent='获取';}});}"
-        "function enc(s){return encodeURIComponent(s).replace(/[!'()*]/g,function(c){return '%'+c.charCodeAt(0).toString(16).toUpperCase();});}"
+        "function enc(s){return encodeURIComponent(s).replace(/[!'()*]/g,function(c){return '%%'+c.charCodeAt(0).toString(16).toUpperCase();});}"
         "function jesc(s){return JSON.stringify(s||'').slice(1,-1);}"
         "function barkKey(u){var s=(u||''),i=s.indexOf('://');if(i>=0)s=s.slice(i+3);i=s.indexOf('/');if(i<0)return '';s=s.slice(i+1);if(!s||s.indexOf('push')===0)return '';return s.split(/[/?#]/)[0];}"
         "function sampleText(){var n=document.getElementById('numInput'),num=n&&n.value?n.value:'N/A';return '接收短信设备手机号:'+num+'\\n[pdu解码后的信息]\\n短消息服务中心:+8613800755500\\n发件人:10086\\n时间戳:26/06/30 12:00:00\\n短信内容:Alice Pusher Bot 示例短信';}"
-        "function updatePreview(){var h=document.getElementById('headInput'),t=document.getElementById('tailInput'),p=document.getElementById('msgPreview'),s=document.getElementById('platformSelect'),w=document.getElementById('webhookInput'),ct=document.getElementById('ctypeInput'),cb=document.getElementById('customBodyInput');if(!p)return;var a=[],text,plat=s?s.value:'dingtalk',ctype='application/json;charset=utf-8',payload='',jt,key,tmpl;if(h&&h.value)a.push(h.value);a.push(sampleText());if(t&&t.value)a.push(t.value);text=a.join('\\n');if(plat==='serverchan'){ctype='application/x-www-form-urlencoded';payload='title=Alice%20Pusher&desp='+enc(text);}else if(plat==='telegram'){ctype='application/x-www-form-urlencoded';payload='text='+enc(text);}else if(plat==='custom'){ctype=(ct&&ct.value)||'application/json;charset=utf-8';tmpl=(cb&&cb.value)||'{\"text\":\"{{json_text}}\"}';payload=tmpl.split('{{json_text}}').join(jesc(text)).split('{{url_text}}').join(enc(text)).split('{{text}}').join(text);}else{jt=jesc(text);if(plat==='feishu')payload='{\"msg_type\":\"text\",\"content\":{\"text\":\"'+jt+'\"}}';else if(plat==='discord')payload='{\"content\":\"'+jt+'\"}';else if(plat==='bark'){key=barkKey(w&&w.value);payload=key?'{\"title\":\"Alice Pusher\",\"body\":\"'+jt+'\",\"device_key\":\"'+jesc(key)+'\"}':'需要填写 Bark URL 以提取 device_key';}else payload='{\"msgtype\":\"text\",\"text\":{\"content\":\"'+jt+'\"}}';}p.textContent='最终文本:\\n'+text+'\\n\\nContent-Type:\\n'+ctype+'\\n\\nPayload:\\n'+payload;}"
+        "function updatePreview(){var h=document.getElementById('headInput'),t=document.getElementById('tailInput'),p=document.getElementById('msgPreview'),s=document.getElementById('platformSelect'),w=document.getElementById('webhookInput'),ct=document.getElementById('ctypeInput'),cb=document.getElementById('customBodyInput');if(!p)return;var a=[],text,plat=s?s.value:'dingtalk',ctype='application/json;charset=utf-8',payload='',jt,key,tmpl;if(h&&h.value)a.push(h.value);a.push(sampleText());if(t&&t.value)a.push(t.value);text=a.join('\\n');if(plat==='serverchan'){ctype='application/x-www-form-urlencoded';payload='title=Alice%%20Pusher&desp='+enc(text);}else if(plat==='telegram'){ctype='application/x-www-form-urlencoded';payload='text='+enc(text);}else if(plat==='custom'){ctype=(ct&&ct.value)||'application/json;charset=utf-8';tmpl=(cb&&cb.value)||'{\"text\":\"{{json_text}}\"}';payload=tmpl.split('{{json_text}}').join(jesc(text)).split('{{url_text}}').join(enc(text)).split('{{text}}').join(text);}else{jt=jesc(text);if(plat==='feishu')payload='{\"msg_type\":\"text\",\"content\":{\"text\":\"'+jt+'\"}}';else if(plat==='discord')payload='{\"content\":\"'+jt+'\"}';else if(plat==='bark'){key=barkKey(w&&w.value);payload=key?'{\"title\":\"Alice Pusher\",\"body\":\"'+jt+'\",\"device_key\":\"'+jesc(key)+'\"}':'需要填写 Bark URL 以提取 device_key';}else payload='{\"msgtype\":\"text\",\"text\":{\"content\":\"'+jt+'\"}}';}p.textContent='最终文本:\\n'+text+'\\n\\nContent-Type:\\n'+ctype+'\\n\\nPayload:\\n'+payload;}"
         "toggleCustom();toggleTarget();updatePreview();"
         "</script></body></html>");
 }
@@ -1350,6 +1553,8 @@ static void render_home(int fd, const char *message) {
     char target_path[256];
     char esc_num[256], esc_hook[256], esc_platform[128];
     char esc_target_label[128], esc_target_path[512];
+    char esc_auto_mode[128], esc_auto_payload[512], esc_auto_script[512];
+    char esc_auto_error[512];
     const char *auto_label;
     const char *auto_detail;
     const char *auto_payload;
@@ -1367,28 +1572,32 @@ static void render_home(int fd, const char *message) {
     target_pid = alice_engine_find_process_by_exe_path(target_path);
     html_escape(esc_num, sizeof(esc_num), cfg.num[0] ? cfg.num : "-");
     html_escape(esc_hook, sizeof(esc_hook), cfg.webhook[0] ? "已配置" : "未配置");
-    html_escape(esc_platform, sizeof(esc_platform), platform_label(cfg.platform));
+    html_escape(esc_platform, sizeof(esc_platform), configured_platform_label(&cfg));
     html_escape(esc_target_label, sizeof(esc_target_label),
                 target_mode_label(cfg.target_mode));
     html_escape(esc_target_path, sizeof(esc_target_path), target_path);
-    if (ast.run_ready && ast.bin_ready)
-        auto_payload = ".run 与二进制已就绪";
-    else if (ast.run_ready)
-        auto_payload = ".run 已就绪";
-    else if (ast.bin_ready)
-        auto_payload = "二进制已就绪";
+    if (ast.payload_ready)
+        auto_payload = ast.payload_path;
     else
         auto_payload = "待安装";
-    if ((ast.run_ready || ast.bin_ready) && ast.script_ready && ast.hook_ready) {
-        auto_label = "已启用";
-        auto_detail = "开机会启动 Alice Pusher WebUI";
-    } else if (ast.script_ready || ast.hook_ready) {
-        auto_label = "部分启用";
-        auto_detail = "启动脚本或系统钩子不完整，可重新启用修复";
+    if (ast.installed && ast.startup_running) {
+        auto_label = "自启动已成功";
+        auto_detail = "当前 WebUI 实例由持久化启动项拉起";
+    } else if (ast.installed) {
+        auto_label = "已安装，等待开机";
+        auto_detail = "持久化启动项和 payload 已就绪";
+    } else if (ast.script_ready || ast.payload_ready) {
+        auto_label = "未完整安装";
+        auto_detail = ast.error[0] ? ast.error : "payload 或启动项不完整";
     } else {
         auto_label = "未启用";
-        auto_detail = "点击启用时会自动复制当前启动文件";
+        auto_detail = "点击安装会根据 Wonder 部署状态选择启动模式";
     }
+    html_escape(esc_auto_mode, sizeof(esc_auto_mode), ast.mode_label);
+    html_escape(esc_auto_payload, sizeof(esc_auto_payload), auto_payload);
+    html_escape(esc_auto_script, sizeof(esc_auto_script), ast.script_path);
+    html_escape(esc_auto_error, sizeof(esc_auto_error),
+                ast.error[0] ? ast.error : "-");
 
     append_page_start(body, WEB_BODY_MAX, "home", "控制台",
                       "管理短信推送服务、strace 状态和测试推送", message);
@@ -1414,19 +1623,26 @@ static void render_home(int fd, const char *message) {
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">开机自启动</div></div><div class=\"pad\"><div class=\"grid\">"
         "<div class=\"kv\"><div class=\"k\">状态</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">说明</div><div class=\"v\">%s</div></div>"
-        "<div class=\"kv\"><div class=\"k\">启动文件</div><div class=\"v\">%s</div></div>"
-        "<div class=\"kv\"><div class=\"k\">启动脚本</div><div class=\"v\">%s</div></div>"
-        "<div class=\"kv\"><div class=\"k\">系统钩子</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">持久化模式</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">Wonder 检测</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">Payload</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">启动项脚本</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">脚本状态</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">安装错误</div><div class=\"v\">%s</div></div>"
         "</div><div class=\"actions\">"
-        "<form method=\"post\" action=\"/autostart_on\"><button type=\"submit\">启用自启动</button></form>"
-        "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\">关闭自启动</button></form>"
-        "</div><div class=\"hint\">持久路径：" DEFAULT_RUN_PATH " / " DEFAULT_BIN_PATH "</div></div></section>",
+        "<form method=\"post\" action=\"/autostart_on\"><button type=\"submit\"%s>安装自启动</button></form>"
+        "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\"%s>卸载自启动</button></form>"
+        "</div><div class=\"hint\">当前入口只使用 userdata；不会修改 rootfs 或 /etc/rc。</div></div></section>",
         spid > 0 ? "运行中" : "未运行", (long)spid, (long)strpid,
         esc_target_label, esc_target_path, target_pid > 0 ? target_pid : 0,
         esc_platform, esc_hook, esc_num,
-        auto_label, auto_detail, auto_payload,
-        ast.script_ready ? "已写入" : "未写入",
-        ast.hook_ready ? "已安装" : "未安装");
+        auto_label, auto_detail, esc_auto_mode,
+        ast.wonder_detected ? "已部署" : "未部署",
+        esc_auto_payload, esc_auto_script,
+        ast.script_ready && ast.entry_ready ? "可正常启动" : "未就绪",
+        esc_auto_error,
+        ast.installed ? " disabled" : "",
+        (ast.payload_ready || ast.script_ready) ? "" : " disabled");
     append_page_end(body, WEB_BODY_MAX);
     http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
     free(body);
@@ -1561,10 +1777,10 @@ static void render_logs(int fd, const char *message) {
     read_log_tail(logbuf, LOG_TAIL_MAX + 1);
     html_escape(esc, LOG_TAIL_MAX * 6 + 1, logbuf[0] ? logbuf : "暂无日志");
     append_page_start(body, WEB_BODY_MAX, "logs", "运行日志",
-                      "环形保留最近 64KB，可导出当前日志窗口", message);
+                      "环形保留最近 1KB，可导出当前日志窗口", message);
     buf_append(body, WEB_BODY_MAX,
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">环形日志</div>"
-        "<div class=\"hint\">页面显示最近 32KB，导出文件包含当前 64KB 环形日志。</div></div>"
+        "<div class=\"hint\">页面显示最近 1KB，导出文件包含当前 1KB 环形日志。</div></div>"
         "<div class=\"pad\"><pre>%s</pre><div class=\"actions\">"
         "<form method=\"get\" action=\"/logs\"><button class=\"alt\" type=\"submit\">刷新</button></form>"
         "<form method=\"get\" action=\"/logs/export\"><button type=\"submit\">导出日志</button></form>"
@@ -1648,34 +1864,55 @@ static void render_sponsor_image(int fd) {
 
 static void render_status_json(int fd) {
     web_config_t cfg;
+    autostart_status_t ast;
     char num[256];
     char platform[96];
     char target_mode[64];
     char target_path[512];
     char target_path_raw[256];
+    char auto_mode[96];
+    char auto_payload[512];
+    char auto_script[512];
+    char auto_error[512];
     pid_t spid = service_pid();
     pid_t strpid = alice_engine_get_strace_pid();
     int target_pid;
     char body[2048];
 
     load_web_config(&cfg);
+    get_autostart_status(&ast);
     if (!process_alive(strpid)) strpid = 0;
     resolve_target_path(&cfg, target_path_raw, sizeof(target_path_raw));
     target_pid = alice_engine_find_process_by_exe_path(target_path_raw);
     json_escape(num, sizeof(num), cfg.num);
-    json_escape(platform, sizeof(platform), platform_label(cfg.platform));
+    json_escape(platform, sizeof(platform), configured_platform_label(&cfg));
     json_escape(target_mode, sizeof(target_mode), target_mode_label(cfg.target_mode));
     json_escape(target_path, sizeof(target_path), target_path_raw);
+    json_escape(auto_mode, sizeof(auto_mode), ast.mode_label);
+    json_escape(auto_payload, sizeof(auto_payload), ast.payload_path);
+    json_escape(auto_script, sizeof(auto_script), ast.script_path);
+    json_escape(auto_error, sizeof(auto_error), ast.error);
     snprintf(body, sizeof(body),
         "{\"service_running\":%s,\"service_pid\":%ld,"
         "\"strace_pid\":%ld,\"target_pid\":%d,\"zte_mifi_pid\":%d,"
         "\"target_mode\":\"%s\",\"target_path\":\"%s\","
         "\"webhook_configured\":%s,\"platform\":\"%s\","
-        "\"num\":\"%s\",\"port\":%d}\n",
+        "\"num\":\"%s\",\"port\":%d,"
+        "\"wonder_detected\":%s,\"persistence_mode\":\"%s\","
+        "\"payload_ready\":%s,\"payload_path\":\"%s\","
+        "\"startup_script_ready\":%s,\"startup_entry_ready\":%s,"
+        "\"startup_installed\":%s,\"startup_running\":%s,"
+        "\"startup_script_path\":\"%s\",\"userdata_free_bytes\":%lu,"
+        "\"payload_required_bytes\":%lu,\"install_error\":\"%s\"}\n",
         spid > 0 ? "true" : "false", (long)spid, (long)strpid,
         target_pid > 0 ? target_pid : 0,
         target_pid > 0 ? target_pid : 0, target_mode, target_path,
-        cfg.webhook[0] ? "true" : "false", platform, num, g_webui_port);
+        cfg.webhook[0] ? "true" : "false", platform, num, g_webui_port,
+        ast.wonder_detected ? "true" : "false", auto_mode,
+        ast.payload_ready ? "true" : "false", auto_payload,
+        ast.script_ready ? "true" : "false", ast.entry_ready ? "true" : "false",
+        ast.installed ? "true" : "false", ast.startup_running ? "true" : "false",
+        auto_script, ast.free_bytes, ast.required_bytes, auto_error);
     http_send(fd, 200, "OK", "application/json; charset=utf-8", body);
 }
 
@@ -1797,33 +2034,37 @@ static void handle_set_port(int fd, const char *body) {
 }
 
 static void handle_autostart_on(int fd) {
-    if (write_autostart_script() < 0) {
-        ring_log_append("[WEBUI] autostart enable failed: script errno=%d", errno);
-        render_home(fd, "自启动脚本写入失败，请检查 /mnt/userdata 是否可写。");
+    web_config_t cfg;
+
+    load_web_config(&cfg);
+    if (install_persistent_autostart(&cfg) < 0) {
+        ring_log_append("[WEBUI] autostart install failed errno=%d detail=%s",
+                        errno, g_autostart_error);
+        if (g_autostart_error[0]) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "安装失败：%s", g_autostart_error);
+            render_home(fd, msg);
+        } else {
+            render_home(fd, "安装失败，请查看运行日志。");
+        }
         return;
     }
-    if (install_autostart_hook() < 0) {
-        ring_log_append("[WEBUI] autostart enable partial: hook errno=%d", errno);
-        render_home(fd, "自启动脚本已写入，但 /etc/rc 钩子安装失败。");
-        return;
-    }
-    ring_log_append("[WEBUI] autostart enabled");
-    render_home(fd, "开机自启动已启用。");
+    ring_log_append("[WEBUI] persistent autostart installed mode=%s",
+                    wonder_deployed() ? "wonder" : "standalone");
+    render_home(fd, wonder_deployed() ?
+                "已复用 Alice Wonder 启动链路，Pushbot 自启动项已安装。" :
+                "Pushbot 独立 path_sh 自启动已安装。");
 }
 
 static void handle_autostart_off(int fd) {
-    int hook_failed = 0;
-
-    if (disable_autostart(&hook_failed) < 0) {
-        ring_log_append("[WEBUI] autostart disable failed hook_failed=%d errno=%d",
-                        hook_failed, errno);
-        render_home(fd, hook_failed ?
-                    "自启动脚本已尝试删除，但 /etc/rc 钩子移除失败。" :
-                    "关闭自启动失败，请检查持久分区状态。");
+    if (disable_autostart() < 0) {
+        ring_log_append("[WEBUI] persistent autostart uninstall failed errno=%d",
+                        errno);
+        render_home(fd, "卸载失败，请检查 userdata 持久分区和运行日志。");
         return;
     }
-    ring_log_append("[WEBUI] autostart disabled");
-    render_home(fd, "开机自启动已关闭。");
+    ring_log_append("[WEBUI] persistent autostart uninstalled");
+    render_home(fd, "Pushbot 持久化自启动已卸载。");
 }
 
 static void handle_start(int fd, const char *self_path) {

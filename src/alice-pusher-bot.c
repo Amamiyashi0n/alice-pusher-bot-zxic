@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <mbedtls/net.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/version.h>
@@ -25,10 +26,17 @@
 #include <sys/stat.h>
 #include <limits.h>
 #define MAX_BUFFER_LEN 4096
+#define STRACE_QUEUE_LINES 64
 #define TARGET_MIFI_PATH ALICE_TARGET_MIFI_PATH
 #define TARGET_UFI_PATH ALICE_TARGET_UFI_PATH
 
 static char g_target_path[256] = TARGET_MIFI_PATH;
+
+static const int g_webhook_ciphersuites[] = {
+    MBEDTLS_TLS_RSA_WITH_AES_128_CBC_SHA256,
+    MBEDTLS_TLS_RSA_WITH_AES_128_CBC_SHA,
+    0
+};
 
 
 // 函数声明
@@ -65,7 +73,7 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
                                         const char *tailtxt);
 
 typedef struct {
-    char lines[256][MAX_BUFFER_LEN];
+    char lines[STRACE_QUEUE_LINES][MAX_BUFFER_LEN];
     int head;
     int tail;
     int count;
@@ -983,6 +991,7 @@ static int post_https_body(const char *webhook, const char *ctype,
         goto cleanup_tls;
     }
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_ciphersuites(&conf, g_webhook_ciphersuites);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
     if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
         print_mbedtls_error(ret, "mbedtls_ssl_setup");

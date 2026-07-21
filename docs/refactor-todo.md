@@ -4,7 +4,7 @@
 
 - 将 `src/alice-sms-pusher.c` 重命名为 `src/webui.c`，作为 WebUI、配置、自启动、服务启停、HTTP 路由和 CLI 入口核心。
 - 将 `src/alice-pusher-bot.c` 作为 PDU/strace/推送引擎核心，不再包含 `main`。
-- 保持单二进制产物：继续输出 `output/alice-pusher-bot` 和 `output/alice-pusher-bot.run`。
+- 保持输出名称：继续输出 `output/alice-pusher-bot` 和带运行库的 `output/alice-pusher-bot.run`。
 
 ## TODO
 
@@ -38,19 +38,28 @@
   - `alice-pusher-bot --mode=send_once ...`
 - 保持现有配置文件格式兼容：`/mnt/userdata/etc_rw/alice_pusher.conf`。
 - 不改变输出二进制名称。
+- 持久化入口优先复用 Alice Wonder 的用户态 `path_sh`：
+  - Wonder 已部署时，Pushbot 启动项写入 `alice_rescue/autostart/alice-pusher-bot.sh`。
+  - Wonder 未部署时，Pushbot 使用自己的 userdata `path_sh` wrapper。
+  - 不修改 rootfs、`/etc/rc` 或 MTD。
+- 安装前检查 userdata 空间；空间不足时拒绝安装，不自动删除 Wonder 文件。
 
 ## 测试项
 
 - [x] `sh ./make.sh` 成功生成 `output/alice-pusher-bot` 和 `output/alice-pusher-bot.run`。
 - [x] 链接阶段无重复符号，重点检查 `main`、`send_webhook_msg`、`decode_pdu`、`signal_handler`。
-- [ ] `output/alice-pusher-bot` 无参数时显示 usage。
-- [ ] `output/alice-pusher-bot --mode=send_once` 缺参数时显示 usage。
+- [x] `output/alice-pusher-bot` 无参数时显示 usage。
+- [x] `output/alice-pusher-bot --mode=send_once` 缺参数时显示 usage。
+- [x] 主程序动态链接 mbedTLS，`.run` 自带并提取三个 mbedTLS 运行库。
+- [x] Webhook 仅启用 TLS1.2 RSA/AES-128 最小 cipher suite，关闭 CA/证书信任校验。
 - [x] WebUI 的启动、停止、重启、测试发送路径都调用引擎 API。
+- [x] 自启动安装/卸载复用 Wonder 用户态入口，并提供 Wonder 检测、模式、脚本和运行状态。
+- [x] Pushbot 持久化安装空间不足时显示明确的需要空间与可用空间。
 
-> 说明：当前构建产物是 ARM 静态二进制，无法在本机 x86 环境直接执行；CLI usage 验证需要在目标设备或 ARM 运行环境中完成。
+> 说明：构建产物是 ARM/uClibc 动态二进制；直接运行裸二进制时需要同时提供 `output/lib` 并设置 `LD_LIBRARY_PATH`，推荐使用自带运行库的 `.run` 包。
 
 ## 已确定方案
 
-- 采用单二进制方案。
+- 采用动态主程序加自带运行库的 `.run` 交付方案。
 - 保留 WebUI 当前已有的全部推送平台和自定义模板能力。
 - WebUI 与引擎在同一二进制内通过 C 函数接口协作，不引入新的进程间协议。
