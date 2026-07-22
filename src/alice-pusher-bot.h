@@ -7,10 +7,19 @@
 #define ALICE_TARGET_MIFI_PATH "/sbin/zte_mifi"
 #define ALICE_TARGET_UFI_PATH "/sbin/zte_ufi"
 #define ALICE_ENGINE_MAX_TARGETS 4
+#define ALICE_ENGINE_SMS_MAX_BYTES 4096
+#define ALICE_ENGINE_PUSH_MESSAGE_MAX 6144
+#define ALICE_ENGINE_PAYLOAD_MAX 24576
+#define ALICE_ENGINE_CONCAT_MAX_PARTS 16
+#define ALICE_ENGINE_CONCAT_MAX_ACTIVE 4
+#define ALICE_ENGINE_CONCAT_TIMEOUT_SECONDS 120
 
 typedef struct {
     int enabled;
     const char *name;
+    const char *num;
+    const char *headtxt;
+    const char *tailtxt;
     const char *type;
     const char *platform;
     const char *webhook;
@@ -43,6 +52,7 @@ typedef struct {
     const char *smtp_security;
     const alice_engine_push_target_t *targets;
     size_t target_count;
+    int long_sms_reassembly;
 } alice_engine_service_config_t;
 
 typedef void (*alice_engine_log_fn)(void *ctx, const char *line);
@@ -54,6 +64,10 @@ void alice_engine_build_push_message(char *out, size_t outsz,
                                      const char *headtxt,
                                      const char *body,
                                      const char *tailtxt);
+int alice_engine_build_push_message_checked(char *out, size_t outsz,
+                                            const char *headtxt,
+                                            const char *body,
+                                            const char *tailtxt);
 int alice_engine_build_webhook_payload(const char *webhook,
                                        const char *platform,
                                        const char *txt,

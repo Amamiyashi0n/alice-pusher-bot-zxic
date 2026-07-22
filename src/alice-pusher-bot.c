@@ -25,8 +25,16 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <limits.h>
-#define MAX_BUFFER_LEN 4096
-#define STRACE_QUEUE_LINES 64
+#include <stdint.h>
+#define MAX_BUFFER_LEN 2048
+#define STRACE_QUEUE_LINES 16
+#define SMS_TEXT_MAX 512
+#define SMS_CONCAT_MAX_PARTS ALICE_ENGINE_CONCAT_MAX_PARTS
+#define SMS_CONCAT_MAX_ACTIVE ALICE_ENGINE_CONCAT_MAX_ACTIVE
+#define SMS_CONCAT_TIMEOUT_SECONDS ALICE_ENGINE_CONCAT_TIMEOUT_SECONDS
+#define SMS_CONCAT_MAX_TEXT ALICE_ENGINE_SMS_MAX_BYTES
+#define SMS_PUSH_MESSAGE_MAX ALICE_ENGINE_PUSH_MESSAGE_MAX
+#define SMS_PAYLOAD_MAX ALICE_ENGINE_PAYLOAD_MAX
 #define TARGET_MIFI_PATH ALICE_TARGET_MIFI_PATH
 #define TARGET_UFI_PATH ALICE_TARGET_UFI_PATH
 
@@ -56,6 +64,8 @@ static void load_device_msisdn_from_nv_show(void);
 static void* strace_thread_func(void* arg);
 static void* pdu_thread_func(void* arg);
 static void engine_log(const char *fmt, ...);
+struct sms_info;
+static int decode_pdu(const char *pdu, struct sms_info *info);
 static int smtp_send_message(const char *host, const char *port,
                              const char *user, const char *password,
                              const char *from, const char *to,
@@ -71,13 +81,13 @@ static void *g_log_ctx;
 
 static void process_strace_line_for_sms(
     const char *line, const alice_engine_push_target_t *targets,
-    size_t target_count, const char *headtxt, const char *tailtxt);
+    size_t target_count, int long_sms_reassembly);
+static void expire_concat_assemblies(time_t now);
 
 typedef struct {
     const alice_engine_push_target_t *targets;
     size_t target_count;
-    const char *headtxt;
-    const char *tailtxt;
+    int long_sms_reassembly;
 } pdu_thread_args_t;
 
 typedef struct {
@@ -354,6 +364,43 @@ static const char *push_target_name(const alice_engine_push_target_t *target,
            "邮箱" : index < ALICE_ENGINE_MAX_TARGETS ? "Webhook" : "目标";
 }
 
+static int send_one_target_message(const alice_engine_push_target_t *target,
+                                   size_t index, const char *txt) {
+    const char *name;
+    int rc = -1;
+
+    if (!target || !target->enabled || !txt)
+        return -1;
+    name = push_target_name(target, index);
+    if (target->type && strcmp(target->type, "email") == 0) {
+        if (target->smtp_host && target->smtp_host[0] &&
+            target->smtp_from && target->smtp_from[0] &&
+            target->smtp_to && target->smtp_to[0]) {
+            rc = smtp_send_message(target->smtp_host, target->smtp_port,
+                                   target->smtp_user, target->smtp_password,
+                                   target->smtp_from, target->smtp_to,
+                                   target->smtp_security, txt);
+        }
+        if (rc < 0)
+            engine_log("[PUSH][%s] email delivery failed", name);
+        else
+            engine_log("[PUSH][%s] email delivery succeeded", name);
+    } else if (target->webhook && target->webhook[0]) {
+        const char *platform = target->platform && target->platform[0] ?
+            target->platform : alice_engine_detect_platform_from_url(target->webhook);
+        rc = alice_engine_send_webhook_msg(
+            target->webhook, platform, txt,
+            target->custom_ctype, target->custom_body);
+        if (rc < 0)
+            engine_log("[PUSH][%s] webhook delivery failed", name);
+        else
+            engine_log("[PUSH][%s] webhook delivery succeeded", name);
+    } else {
+        engine_log("[PUSH][%s] target configuration is incomplete", name);
+    }
+    return rc;
+}
+
 int alice_engine_send_target_list(const alice_engine_push_target_t *targets,
                                   size_t target_count,
                                   const char *txt) {
@@ -365,39 +412,21 @@ int alice_engine_send_target_list(const alice_engine_push_target_t *targets,
         return -1;
     for (i = 0; i < target_count; i++) {
         const alice_engine_push_target_t *target = &targets[i];
-        const char *name;
+        char target_txt[ALICE_ENGINE_PUSH_MESSAGE_MAX];
         int rc = -1;
 
         if (!target->enabled)
             continue;
         configured = 1;
-        name = push_target_name(target, i);
-        if (target->type && strcmp(target->type, "email") == 0) {
-            if (target->smtp_host && target->smtp_host[0] &&
-                target->smtp_from && target->smtp_from[0] &&
-                target->smtp_to && target->smtp_to[0]) {
-                rc = smtp_send_message(target->smtp_host, target->smtp_port,
-                                       target->smtp_user, target->smtp_password,
-                                       target->smtp_from, target->smtp_to,
-                                       target->smtp_security, txt);
-            }
-            if (rc < 0)
-                engine_log("[PUSH][%s] email delivery failed", name);
-            else
-                engine_log("[PUSH][%s] email delivery succeeded", name);
-        } else if (target->webhook && target->webhook[0]) {
-            const char *platform = target->platform && target->platform[0] ?
-                target->platform : alice_engine_detect_platform_from_url(target->webhook);
-            rc = alice_engine_send_webhook_msg(
-                target->webhook, platform, txt,
-                target->custom_ctype, target->custom_body);
-            if (rc < 0)
-                engine_log("[PUSH][%s] webhook delivery failed", name);
-            else
-                engine_log("[PUSH][%s] webhook delivery succeeded", name);
-        } else {
-            engine_log("[PUSH][%s] target configuration is incomplete", name);
+        if (alice_engine_build_push_message_checked(
+                target_txt, sizeof(target_txt), target->headtxt, txt,
+                target->tailtxt) < 0) {
+            engine_log("[PUSH][%s] formatted message exceeds push buffer",
+                       push_target_name(target, i));
+            failed = 1;
+            continue;
         }
+        rc = send_one_target_message(target, i, target_txt);
         if (rc < 0)
             failed = 1;
     }
@@ -469,6 +498,9 @@ int alice_engine_start_service(const alice_engine_service_config_t *cfg) {
             legacy_targets[target_count].enabled = 1;
             legacy_targets[target_count].name = "Webhook";
             legacy_targets[target_count].type = "webhook";
+            legacy_targets[target_count].num = cfg->num;
+            legacy_targets[target_count].headtxt = cfg->headtxt;
+            legacy_targets[target_count].tailtxt = cfg->tailtxt;
             legacy_targets[target_count].platform = cfg->platform;
             legacy_targets[target_count].webhook = cfg->webhook;
             legacy_targets[target_count].custom_ctype = cfg->custom_ctype;
@@ -481,6 +513,9 @@ int alice_engine_start_service(const alice_engine_service_config_t *cfg) {
             legacy_targets[target_count].enabled = 1;
             legacy_targets[target_count].name = "邮箱";
             legacy_targets[target_count].type = "email";
+            legacy_targets[target_count].num = cfg->num;
+            legacy_targets[target_count].headtxt = cfg->headtxt;
+            legacy_targets[target_count].tailtxt = cfg->tailtxt;
             legacy_targets[target_count].smtp_host = cfg->smtp_host;
             legacy_targets[target_count].smtp_port = cfg->smtp_port;
             legacy_targets[target_count].smtp_user = cfg->smtp_user;
@@ -526,8 +561,7 @@ int alice_engine_start_service(const alice_engine_service_config_t *cfg) {
     }
     pdu_args.targets = targets;
     pdu_args.target_count = target_count;
-    pdu_args.headtxt = cfg->headtxt;
-    pdu_args.tailtxt = cfg->tailtxt;
+    pdu_args.long_sms_reassembly = cfg->long_sms_reassembly ? 1 : 0;
     if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func,
                        &pdu_args) != 0) {
         engine_log("[ENGINE] failed to create PDU thread errno=%d", errno);
@@ -634,12 +668,14 @@ static void* strace_thread_func(void* arg) {
                         }
                         if (c == '\n') {
                             partial[partial_len] = 0;
-                            strace_queue_push_line(partial);
+                            if (strstr(partial, "+CMT: ") != NULL)
+                                strace_queue_push_line(partial);
                             partial_len = 0;
                         }
                         if (partial_len + 1 >= sizeof(partial)) {
                             partial[partial_len] = 0;
-                            strace_queue_push_line(partial);
+                            if (strstr(partial, "+CMT: ") != NULL)
+                                strace_queue_push_line(partial);
                             partial_len = 0;
                         }
                     }
@@ -688,15 +724,19 @@ static void* pdu_thread_func(void* arg) {
         char line[MAX_BUFFER_LEN];
         if (strace_queue_pop_line(line, sizeof(line), 1000)) {
             process_strace_line_for_sms(line, args->targets, args->target_count,
-                                        args->headtxt, args->tailtxt);
+                                        args->long_sms_reassembly);
+        } else {
+            expire_concat_assemblies(time(NULL));
         }
     }
     return NULL;
 }
 
-// PDU解码信息结构体和解码函数
+// PDU解码信息和有限的长短信拼合缓存
+#define SMS_UNIQ_QUEUE_SIZE 100
+#define SMS_CONCAT_PART_BYTES SMS_TEXT_MAX
 
-typedef struct {
+typedef struct sms_info {
     char smsc[32];
     char sender[32];
     char timestamp[32];
@@ -705,22 +745,47 @@ typedef struct {
     char tp_dcs_desc[32];
     char sms_class[8];
     char alphabet[32];
-    char text[2048];
+    char text[SMS_TEXT_MAX];
     int text_len;
+    int coding;
+    int has_udh;
+    int is_concat;
+    unsigned int concat_ref;
+    unsigned int concat_ref_bytes;
+    unsigned int concat_total;
+    unsigned int concat_seq;
 } sms_info_t;
 
-// 新增：基于Sender+TimeStamp+Text的去重队列
-#define SMS_UNIQ_QUEUE_SIZE 100
+enum {
+    SMS_CODING_GSM7 = 0,
+    SMS_CODING_UCS2 = 1
+};
+
 typedef struct {
     char sender[32];
     char timestamp[32];
-    char text[2048];
+    unsigned int reference;
+    unsigned int reference_bytes;
+    unsigned int total;
+    unsigned int received_mask;
+    time_t last_seen;
+    char parts[SMS_CONCAT_MAX_PARTS][SMS_CONCAT_PART_BYTES];
+    int used;
+} sms_concat_assembly_t;
+
+typedef struct {
+    char sender[32];
+    char timestamp[32];
+    char text[SMS_TEXT_MAX];
 } sms_uniq_t;
+
 static sms_uniq_t sms_uniq_queue[SMS_UNIQ_QUEUE_SIZE];
 static int sms_uniq_head = 0;
 static int sms_uniq_count = 0;
+static sms_concat_assembly_t g_concat_assemblies[SMS_CONCAT_MAX_ACTIVE];
 
-static int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const char *text) {
+static int is_sms_uniq_in_queue(const char *sender, const char *timestamp,
+                                const char *text) {
     int i;
     for (i = 0; i < sms_uniq_count; i++) {
         int idx = (sms_uniq_head + i) % SMS_UNIQ_QUEUE_SIZE;
@@ -732,26 +797,491 @@ static int is_sms_uniq_in_queue(const char *sender, const char *timestamp, const
     }
     return 0;
 }
-static void add_sms_uniq_to_queue(const char *sender, const char *timestamp, const char *text) {
+
+static void add_sms_uniq_to_queue(const char *sender, const char *timestamp,
+                                  const char *text) {
     int idx;
     if (sms_uniq_count < SMS_UNIQ_QUEUE_SIZE) {
         idx = (sms_uniq_head + sms_uniq_count) % SMS_UNIQ_QUEUE_SIZE;
-        strncpy(sms_uniq_queue[idx].sender, sender, sizeof(sms_uniq_queue[idx].sender)-1);
-        sms_uniq_queue[idx].sender[sizeof(sms_uniq_queue[idx].sender)-1] = 0;
-        strncpy(sms_uniq_queue[idx].timestamp, timestamp, sizeof(sms_uniq_queue[idx].timestamp)-1);
-        sms_uniq_queue[idx].timestamp[sizeof(sms_uniq_queue[idx].timestamp)-1] = 0;
-        strncpy(sms_uniq_queue[idx].text, text, sizeof(sms_uniq_queue[idx].text)-1);
-        sms_uniq_queue[idx].text[sizeof(sms_uniq_queue[idx].text)-1] = 0;
+        safe_copy(sms_uniq_queue[idx].sender,
+                  sizeof(sms_uniq_queue[idx].sender), sender);
+        safe_copy(sms_uniq_queue[idx].timestamp,
+                  sizeof(sms_uniq_queue[idx].timestamp), timestamp);
+        safe_copy(sms_uniq_queue[idx].text,
+                  sizeof(sms_uniq_queue[idx].text), text);
         sms_uniq_count++;
     } else {
-        strncpy(sms_uniq_queue[sms_uniq_head].sender, sender, sizeof(sms_uniq_queue[0].sender)-1);
-        sms_uniq_queue[sms_uniq_head].sender[sizeof(sms_uniq_queue[0].sender)-1] = 0;
-        strncpy(sms_uniq_queue[sms_uniq_head].timestamp, timestamp, sizeof(sms_uniq_queue[0].timestamp)-1);
-        sms_uniq_queue[sms_uniq_head].timestamp[sizeof(sms_uniq_queue[0].timestamp)-1] = 0;
-        strncpy(sms_uniq_queue[sms_uniq_head].text, text, sizeof(sms_uniq_queue[0].text)-1);
-        sms_uniq_queue[sms_uniq_head].text[sizeof(sms_uniq_queue[0].text)-1] = 0;
+        safe_copy(sms_uniq_queue[sms_uniq_head].sender,
+                  sizeof(sms_uniq_queue[0].sender), sender);
+        safe_copy(sms_uniq_queue[sms_uniq_head].timestamp,
+                  sizeof(sms_uniq_queue[0].timestamp), timestamp);
+        safe_copy(sms_uniq_queue[sms_uniq_head].text,
+                  sizeof(sms_uniq_queue[0].text), text);
         sms_uniq_head = (sms_uniq_head + 1) % SMS_UNIQ_QUEUE_SIZE;
     }
+}
+
+static int pdu_hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static int pdu_read_byte(const char *pdu, size_t pdu_len, size_t *pos,
+                        unsigned char *out) {
+    int hi;
+    int lo;
+
+    if (!pdu || !pos || !out || *pos + 2 > pdu_len)
+        return -1;
+    hi = pdu_hex_value(pdu[*pos]);
+    lo = pdu_hex_value(pdu[*pos + 1]);
+    if (hi < 0 || lo < 0)
+        return -1;
+    *out = (unsigned char)((hi << 4) | lo);
+    *pos += 2;
+    return 0;
+}
+
+static void decode_bcd_number(char *out, size_t outsz,
+                              const unsigned char *bytes, size_t byte_count,
+                              unsigned int digit_count) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t i;
+    size_t used = 0;
+
+    if (!outsz) return;
+    out[0] = 0;
+    for (i = 0; i < byte_count && used + 1 < outsz; i++) {
+        unsigned int low = bytes[i] & 0x0f;
+        unsigned int high = (bytes[i] >> 4) & 0x0f;
+        if (digit_count == 0 || used < digit_count) {
+            if (low <= 9) out[used++] = hex[low];
+        }
+        if (digit_count == 0 || used < digit_count) {
+            if (high <= 9) out[used++] = hex[high];
+        }
+    }
+    out[used] = 0;
+}
+
+static int append_utf8_codepoint(char *out, size_t outsz, size_t *used,
+                                 unsigned long codepoint) {
+    if (!out || !used || codepoint > 0x10ffff ||
+        (codepoint >= 0xd800 && codepoint <= 0xdfff))
+        return -1;
+    if (codepoint < 0x80) {
+        if (*used + 1 >= outsz) return -1;
+        out[(*used)++] = (char)codepoint;
+    } else if (codepoint < 0x800) {
+        if (*used + 2 >= outsz) return -1;
+        out[(*used)++] = (char)(0xc0 | (codepoint >> 6));
+        out[(*used)++] = (char)(0x80 | (codepoint & 0x3f));
+    } else {
+        if (*used + 3 >= outsz) return -1;
+        out[(*used)++] = (char)(0xe0 | (codepoint >> 12));
+        out[(*used)++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+        out[(*used)++] = (char)(0x80 | (codepoint & 0x3f));
+    }
+    out[*used] = 0;
+    return 0;
+}
+
+static const uint16_t gsm7_default[128] = {
+    0x0040, 0x00a3, 0x0024, 0x00a5, 0x00e8, 0x00e9, 0x00f9, 0x00ec,
+    0x00f2, 0x00c7, 0x000a, 0x00d8, 0x00f8, 0x000d, 0x00c5, 0x00e5,
+    0x0394, 0x005f, 0x03a6, 0x0393, 0x039b, 0x03a9, 0x03a0, 0x03a8,
+    0x03a3, 0x0398, 0x039e, 0x001b, 0x00c6, 0x00e6, 0x00df, 0x00c9,
+    0x0020, 0x0021, 0x0022, 0x0023, 0x00a4, 0x0025, 0x0026, 0x0027,
+    0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,
+    0x00a1, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+    0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
+    0x0058, 0x0059, 0x005a, 0x00c4, 0x00d6, 0x00d1, 0x00dc, 0x00a7,
+    0x00bf, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
+    0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
+    0x0078, 0x0079, 0x007a, 0x00e4, 0x00f6, 0x00f1, 0x00fc, 0x00e0
+};
+
+static int gsm7_extension_codepoint(unsigned int value,
+                                    unsigned long *codepoint) {
+    if (!codepoint) return -1;
+    switch (value) {
+    case 0x0a: *codepoint = 0x000c; return 0;
+    case 0x14: *codepoint = 0x005e; return 0;
+    case 0x28: *codepoint = 0x007b; return 0;
+    case 0x29: *codepoint = 0x007d; return 0;
+    case 0x2f: *codepoint = 0x005c; return 0;
+    case 0x3c: *codepoint = 0x005b; return 0;
+    case 0x3d: *codepoint = 0x007e; return 0;
+    case 0x3e: *codepoint = 0x005d; return 0;
+    case 0x40: *codepoint = 0x007c; return 0;
+    case 0x65: *codepoint = 0x20ac; return 0;
+    default: return -1;
+    }
+}
+
+static int parse_concat_udh(const unsigned char *ud, size_t ud_bytes,
+                            sms_info_t *info, size_t *header_bytes) {
+    size_t pos;
+    size_t end;
+
+    if (!ud || !info || !header_bytes || ud_bytes == 0)
+        return -1;
+    *header_bytes = (size_t)ud[0] + 1;
+    if (*header_bytes > ud_bytes)
+        return -1;
+    pos = 1;
+    end = *header_bytes;
+    while (pos < end) {
+        unsigned int iei;
+        unsigned int ielen;
+        if (pos + 2 > end)
+            return -1;
+        iei = ud[pos++];
+        ielen = ud[pos++];
+        if (pos + ielen > end)
+            return -1;
+        if (iei == 0x00 && ielen == 3) {
+            info->is_concat = 1;
+            info->concat_ref = ud[pos];
+            info->concat_ref_bytes = 1;
+            info->concat_total = ud[pos + 1];
+            info->concat_seq = ud[pos + 2];
+        } else if (iei == 0x08 && ielen == 4) {
+            info->is_concat = 1;
+            info->concat_ref = ((unsigned int)ud[pos] << 8) | ud[pos + 1];
+            info->concat_ref_bytes = 2;
+            info->concat_total = ud[pos + 2];
+            info->concat_seq = ud[pos + 3];
+        }
+        pos += ielen;
+    }
+    if (info->is_concat &&
+        (info->concat_total == 0 || info->concat_seq == 0 ||
+         info->concat_seq > info->concat_total))
+        return -1;
+    return 0;
+}
+
+static int decode_gsm7_text(const unsigned char *ud, size_t ud_bytes,
+                            size_t header_bytes, unsigned int udl,
+                            char *out, size_t outsz) {
+    size_t header_septets = (header_bytes * 8 + 6) / 7;
+    size_t text_septets;
+    size_t i;
+    size_t used = 0;
+    int escaped = 0;
+
+    if (udl < header_septets)
+        return -1;
+    text_septets = (size_t)udl - header_septets;
+    for (i = 0; i < text_septets; i++) {
+        size_t bitpos = header_bytes * 8 + i * 7;
+        size_t bytepos = bitpos / 8;
+        unsigned int value;
+        unsigned long codepoint;
+
+        if (bytepos >= ud_bytes)
+            return -1;
+        value = (unsigned int)(ud[bytepos] >> (bitpos % 8));
+        if (bitpos % 8 > 1 && bytepos + 1 < ud_bytes)
+            value |= (unsigned int)ud[bytepos + 1] << (8 - (bitpos % 8));
+        value &= 0x7f;
+        if (escaped) {
+            if (gsm7_extension_codepoint(value, &codepoint) < 0)
+                codepoint = '?';
+            escaped = 0;
+        } else if (value == 0x1b) {
+            escaped = 1;
+            continue;
+        } else {
+            codepoint = gsm7_default[value];
+        }
+        if (append_utf8_codepoint(out, outsz, &used, codepoint) < 0)
+            return -1;
+    }
+    if (escaped && append_utf8_codepoint(out, outsz, &used, '?') < 0)
+        return -1;
+    return 0;
+}
+
+static int decode_ucs2_text(const unsigned char *ud, size_t ud_bytes,
+                            size_t header_bytes, char *out, size_t outsz) {
+    size_t pos = header_bytes;
+    size_t used = 0;
+
+    if (pos > ud_bytes || ((ud_bytes - pos) % 2) != 0)
+        return -1;
+    while (pos + 1 < ud_bytes) {
+        unsigned long codepoint = ((unsigned long)ud[pos] << 8) | ud[pos + 1];
+        if (append_utf8_codepoint(out, outsz, &used, codepoint) < 0)
+            return -1;
+        pos += 2;
+    }
+    return 0;
+}
+
+static int decode_pdu(const char *pdu, sms_info_t *info) {
+    size_t pdu_len;
+    size_t pos = 0;
+    unsigned char value;
+    unsigned char smsc_bytes[32];
+    unsigned char sender_bytes[32];
+    unsigned char ud[256];
+    size_t smsc_count;
+    size_t sender_count;
+    size_t ud_bytes;
+    size_t expected_ud_bytes;
+    size_t header_bytes = 0;
+    unsigned int smsc_len;
+    unsigned int sender_len;
+    unsigned int first_octet;
+    unsigned int dcs;
+    unsigned int udl;
+    unsigned int i;
+    unsigned char timestamp[7];
+    char timestamp_digits[15];
+
+    if (!pdu || !info)
+        return -1;
+    memset(info, 0, sizeof(*info));
+    pdu_len = strlen(pdu);
+    if (pdu_len < 20 || (pdu_len & 1) != 0)
+        return -1;
+
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    smsc_len = value;
+    if (smsc_len > 0) {
+        if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+            return -1;
+        smsc_count = smsc_len - 1;
+        if (smsc_count > sizeof(smsc_bytes))
+            return -1;
+        for (i = 0; i < smsc_count; i++)
+            if (pdu_read_byte(pdu, pdu_len, &pos, &smsc_bytes[i]) < 0)
+                return -1;
+        decode_bcd_number(info->smsc, sizeof(info->smsc), smsc_bytes,
+                          smsc_count, 0);
+        if (strncmp(info->smsc, "86", 2) == 0)
+            memmove(info->smsc, info->smsc + 2,
+                    strlen(info->smsc + 2) + 1);
+    }
+
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    first_octet = value;
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    sender_len = value;
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    sender_count = (sender_len + 1) / 2;
+    if (sender_count > sizeof(sender_bytes))
+        return -1;
+    for (i = 0; i < sender_count; i++)
+        if (pdu_read_byte(pdu, pdu_len, &pos, &sender_bytes[i]) < 0)
+            return -1;
+    decode_bcd_number(info->sender, sizeof(info->sender), sender_bytes,
+                      sender_count, sender_len);
+    if (strncmp(info->sender, "86", 2) == 0)
+        memmove(info->sender, info->sender + 2,
+                strlen(info->sender + 2) + 1);
+
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    snprintf(info->tp_pid, sizeof(info->tp_pid), "%02X", value);
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    dcs = value;
+    snprintf(info->tp_dcs, sizeof(info->tp_dcs), "%02X", dcs);
+    if ((dcs & 0x0c) == 0x00) {
+        info->coding = SMS_CODING_GSM7;
+        safe_copy(info->tp_dcs_desc, sizeof(info->tp_dcs_desc), "GSM 7-bit");
+        safe_copy(info->sms_class, sizeof(info->sms_class), "0");
+        safe_copy(info->alphabet, sizeof(info->alphabet), "GSM 7-bit");
+    } else if ((dcs & 0x0c) == 0x08) {
+        info->coding = SMS_CODING_UCS2;
+        safe_copy(info->tp_dcs_desc, sizeof(info->tp_dcs_desc),
+                  "Uncompressed Text");
+        safe_copy(info->sms_class, sizeof(info->sms_class), "0");
+        safe_copy(info->alphabet, sizeof(info->alphabet), "UCS2(16)bit");
+    } else {
+        engine_log("[PDU] unsupported DCS=0x%02X", dcs);
+        return -1;
+    }
+
+    for (i = 0; i < 7; i++)
+        if (pdu_read_byte(pdu, pdu_len, &pos, &timestamp[i]) < 0)
+            return -1;
+    for (i = 0; i < 7; i++) {
+        static const char hex[] = "0123456789ABCDEF";
+        timestamp_digits[i * 2] = hex[timestamp[i] & 0x0f];
+        timestamp_digits[i * 2 + 1] = hex[(timestamp[i] >> 4) & 0x0f];
+    }
+    timestamp_digits[14] = 0;
+    snprintf(info->timestamp, sizeof(info->timestamp),
+             "%c%c/%c%c/%c%c %c%c:%c%c:%c%c",
+             timestamp_digits[0], timestamp_digits[1],
+             timestamp_digits[2], timestamp_digits[3],
+             timestamp_digits[4], timestamp_digits[5],
+             timestamp_digits[6], timestamp_digits[7],
+             timestamp_digits[8], timestamp_digits[9],
+             timestamp_digits[10], timestamp_digits[11]);
+
+    if (pdu_read_byte(pdu, pdu_len, &pos, &value) < 0)
+        return -1;
+    udl = value;
+    info->text_len = (int)udl;
+    expected_ud_bytes = info->coding == SMS_CODING_GSM7 ?
+        ((size_t)udl * 7 + 7) / 8 : (size_t)udl;
+    if (expected_ud_bytes > sizeof(ud) ||
+        expected_ud_bytes > (pdu_len - pos) / 2)
+        return -1;
+    ud_bytes = expected_ud_bytes;
+    for (i = 0; i < ud_bytes; i++)
+        if (pdu_read_byte(pdu, pdu_len, &pos, &ud[i]) < 0)
+            return -1;
+
+    info->has_udh = (first_octet & 0x40) != 0;
+    if (info->has_udh && parse_concat_udh(ud, ud_bytes, info,
+                                          &header_bytes) < 0)
+        return -1;
+    if (!info->has_udh)
+        header_bytes = 0;
+    if (info->coding == SMS_CODING_GSM7)
+        return decode_gsm7_text(ud, ud_bytes, header_bytes, udl,
+                                info->text, sizeof(info->text));
+    return decode_ucs2_text(ud, ud_bytes, header_bytes,
+                            info->text, sizeof(info->text));
+}
+
+static int concat_key_matches(const sms_concat_assembly_t *assembly,
+                              const sms_info_t *info) {
+    return assembly && info && assembly->used &&
+           assembly->reference == info->concat_ref &&
+           assembly->reference_bytes == info->concat_ref_bytes &&
+           assembly->total == info->concat_total &&
+           strcmp(assembly->sender, info->sender) == 0 &&
+           strcmp(assembly->timestamp, info->timestamp) == 0;
+}
+
+static void expire_concat_assemblies(time_t now) {
+    int i;
+
+    for (i = 0; i < SMS_CONCAT_MAX_ACTIVE; i++) {
+        sms_concat_assembly_t *assembly = &g_concat_assemblies[i];
+        if (!assembly->used)
+            continue;
+        if (now - assembly->last_seen >= SMS_CONCAT_TIMEOUT_SECONDS) {
+            engine_log("[PDU] concat timeout sender=%s ref=%u received=%u/%u",
+                       assembly->sender, assembly->reference,
+                       (unsigned int)__builtin_popcount(assembly->received_mask),
+                       assembly->total);
+            memset(assembly, 0, sizeof(*assembly));
+        }
+    }
+}
+
+static sms_concat_assembly_t *find_concat_assembly(const sms_info_t *info,
+                                                   time_t now) {
+    sms_concat_assembly_t *free_slot = NULL;
+    sms_concat_assembly_t *oldest = NULL;
+    int i;
+
+    expire_concat_assemblies(now);
+    for (i = 0; i < SMS_CONCAT_MAX_ACTIVE; i++) {
+        sms_concat_assembly_t *assembly = &g_concat_assemblies[i];
+        if (concat_key_matches(assembly, info))
+            return assembly;
+        if (!assembly->used && !free_slot)
+            free_slot = assembly;
+        if (assembly->used &&
+            (!oldest || assembly->last_seen < oldest->last_seen))
+            oldest = assembly;
+    }
+    if (!free_slot)
+        free_slot = oldest;
+    if (!free_slot)
+        return NULL;
+    if (free_slot->used) {
+        engine_log("[PDU] concat cache full, evict sender=%s ref=%u received=%u/%u",
+                   free_slot->sender, free_slot->reference,
+                   (unsigned int)__builtin_popcount(free_slot->received_mask),
+                   free_slot->total);
+    }
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->used = 1;
+    safe_copy(free_slot->sender, sizeof(free_slot->sender), info->sender);
+    safe_copy(free_slot->timestamp, sizeof(free_slot->timestamp),
+              info->timestamp);
+    free_slot->reference = info->concat_ref;
+    free_slot->reference_bytes = info->concat_ref_bytes;
+    free_slot->total = info->concat_total;
+    free_slot->last_seen = now;
+    return free_slot;
+}
+
+static int add_concat_segment(const sms_info_t *info, char *assembled,
+                              size_t assembled_sz) {
+    sms_concat_assembly_t *assembly;
+    size_t text_len;
+    unsigned int bit;
+    unsigned int i;
+    size_t used = 0;
+    time_t now = time(NULL);
+
+    if (!info || !info->is_concat || !assembled || assembled_sz == 0)
+        return -1;
+    if (info->concat_total > SMS_CONCAT_MAX_PARTS ||
+        info->concat_seq == 0 || info->concat_seq > SMS_CONCAT_MAX_PARTS) {
+        engine_log("[PDU] concat exceeds limits ref=%u total=%u seq=%u",
+                   info->concat_ref, info->concat_total, info->concat_seq);
+        return -1;
+    }
+    text_len = strlen(info->text);
+    if (text_len >= SMS_CONCAT_PART_BYTES) {
+        engine_log("[PDU] concat segment too long ref=%u bytes=%lu",
+                   info->concat_ref, (unsigned long)text_len);
+        return -1;
+    }
+    assembly = find_concat_assembly(info, now);
+    if (!assembly)
+        return -1;
+    assembly->last_seen = now;
+    bit = 1U << (info->concat_seq - 1);
+    if (assembly->received_mask & bit) {
+        if (strcmp(assembly->parts[info->concat_seq - 1], info->text) != 0)
+            engine_log("[PDU] duplicate concat segment differs ref=%u seq=%u",
+                       info->concat_ref, info->concat_seq);
+        return 0;
+    }
+    safe_copy(assembly->parts[info->concat_seq - 1],
+              sizeof(assembly->parts[info->concat_seq - 1]), info->text);
+    assembly->received_mask |= bit;
+    if (assembly->received_mask != ((1U << assembly->total) - 1U))
+        return 0;
+
+    assembled[0] = 0;
+    for (i = 0; i < assembly->total; i++) {
+        size_t part_len = strlen(assembly->parts[i]);
+        if (used + part_len >= assembled_sz) {
+            engine_log("[PDU] concat message too long ref=%u bytes>%lu",
+                       info->concat_ref, (unsigned long)(assembled_sz - 1));
+            memset(assembly, 0, sizeof(*assembly));
+            return -1;
+        }
+        memcpy(assembled + used, assembly->parts[i], part_len);
+        used += part_len;
+    }
+    assembled[used] = 0;
+    memset(assembly, 0, sizeof(*assembly));
+    return 1;
 }
 
 static void load_device_msisdn_from_nv_show(void) {
@@ -779,7 +1309,8 @@ static void load_device_msisdn_from_nv_show(void) {
     pclose(fp);
 }
 
-// 完整的PDU解码，包含SMSC、发件人、时间戳等信息
+/* Legacy UCS2-only decoder retained as reference for older captures. */
+#if 0
 static void decode_pdu(const char *pdu, sms_info_t *info) {
     memset(info, 0, sizeof(*info));
     int idx = 0;
@@ -922,6 +1453,7 @@ static void decode_pdu(const char *pdu, sms_info_t *info) {
     info->text[k] = 0;
     free(ucs2_hex);
 }
+#endif
 
 static void form_url_escape(char *out, size_t outsz, const char *in) {
     static const char hex[] = "0123456789ABCDEF";
@@ -966,21 +1498,31 @@ static int replace_token(char *out, size_t outsz, const char *token,
 
 static int render_custom_body(const char *tmpl, const char *txt,
                               char *out, size_t outsz) {
-    char json_txt[3072];
-    char url_txt[3072];
+    char *json_txt;
+    char *url_txt;
+    int rc = -1;
 
     if (!tmpl || !tmpl[0] || !outsz)
         return -1;
+    json_txt = (char *)malloc(SMS_PAYLOAD_MAX);
+    url_txt = (char *)malloc(SMS_PAYLOAD_MAX);
+    if (!json_txt || !url_txt)
+        goto cleanup;
     safe_copy(out, outsz, tmpl);
-    json_escape(json_txt, sizeof(json_txt), txt);
-    form_url_escape(url_txt, sizeof(url_txt), txt);
+    json_escape(json_txt, SMS_PAYLOAD_MAX, txt);
+    form_url_escape(url_txt, SMS_PAYLOAD_MAX, txt);
     if (replace_token(out, outsz, "{{json_text}}", json_txt) < 0)
-        return -1;
+        goto cleanup;
     if (replace_token(out, outsz, "{{url_text}}", url_txt) < 0)
-        return -1;
+        goto cleanup;
     if (replace_token(out, outsz, "{{text}}", txt ? txt : "") < 0)
-        return -1;
-    return 0;
+        goto cleanup;
+    rc = 0;
+
+cleanup:
+    free(json_txt);
+    free(url_txt);
+    return rc;
 }
 
 static int extract_bark_device_key(const char *url, char *out, size_t outsz) {
@@ -1017,27 +1559,34 @@ int alice_engine_build_webhook_payload(const char *webhook, const char *platform
                                  const char *custom_body,
                                  char *payload, size_t payload_sz,
                                  char *ctype, size_t ctype_sz) {
-    char safe_txt[3072];
+    char *safe_txt;
     char safe_key[512];
-    char enc_txt[3072];
+    char *enc_txt;
     const char *p = platform && platform[0] ? platform : "dingtalk";
+    int rc = -1;
 
-    if (!payload_sz || !ctype_sz)
+    if (!payload || !ctype || !payload_sz || !ctype_sz || !txt)
         return -1;
+    safe_txt = (char *)malloc(SMS_PAYLOAD_MAX);
+    enc_txt = (char *)malloc(SMS_PAYLOAD_MAX);
+    if (!safe_txt || !enc_txt)
+        goto cleanup;
     payload[0] = 0;
     ctype[0] = 0;
 
     if (strcmp(p, "serverchan") == 0) {
-        form_url_escape(enc_txt, sizeof(enc_txt), txt);
+        form_url_escape(enc_txt, SMS_PAYLOAD_MAX, txt);
         snprintf(ctype, ctype_sz, "application/x-www-form-urlencoded");
         snprintf(payload, payload_sz, "title=Alice%%20Pusher&desp=%s", enc_txt);
-        return payload[0] ? 0 : -1;
+        rc = payload[0] ? 0 : -1;
+        goto cleanup;
     }
     if (strcmp(p, "telegram") == 0) {
-        form_url_escape(enc_txt, sizeof(enc_txt), txt);
+        form_url_escape(enc_txt, SMS_PAYLOAD_MAX, txt);
         snprintf(ctype, ctype_sz, "application/x-www-form-urlencoded");
         snprintf(payload, payload_sz, "text=%s", enc_txt);
-        return payload[0] ? 0 : -1;
+        rc = payload[0] ? 0 : -1;
+        goto cleanup;
     }
     if (strcmp(p, "custom") == 0) {
         const char *tmpl = custom_body && custom_body[0] ? custom_body :
@@ -1046,11 +1595,12 @@ int alice_engine_build_webhook_payload(const char *webhook, const char *platform
                  custom_ctype && custom_ctype[0] ? custom_ctype :
                  "application/json;charset=utf-8");
         if (render_custom_body(tmpl, txt, payload, payload_sz) < 0)
-            return -1;
-        return payload[0] ? 0 : -1;
+            goto cleanup;
+        rc = payload[0] ? 0 : -1;
+        goto cleanup;
     }
 
-    json_escape(safe_txt, sizeof(safe_txt), txt);
+    json_escape(safe_txt, SMS_PAYLOAD_MAX, txt);
     snprintf(ctype, ctype_sz, "application/json;charset=utf-8");
     if (strcmp(p, "feishu") == 0) {
         snprintf(payload, payload_sz,
@@ -1063,7 +1613,7 @@ int alice_engine_build_webhook_payload(const char *webhook, const char *platform
     } else if (strcmp(p, "bark") == 0) {
         char bark_key[256];
         if (extract_bark_device_key(webhook, bark_key, sizeof(bark_key)) < 0)
-            return -1;
+            goto cleanup;
         json_escape(safe_key, sizeof(safe_key), bark_key);
         snprintf(payload, payload_sz,
                  "{\"title\":\"Alice Pusher\",\"body\":\"%s\",\"device_key\":\"%s\"}",
@@ -1073,16 +1623,22 @@ int alice_engine_build_webhook_payload(const char *webhook, const char *platform
                  "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}",
                  safe_txt);
     }
-    return payload[0] ? 0 : -1;
+    rc = payload[0] ? 0 : -1;
+
+cleanup:
+    free(safe_txt);
+    free(enc_txt);
+    return rc;
 }
 
 static int post_https_body(const char *webhook, const char *ctype,
                            const char *payload, const char *platform) {
     char *host = NULL, *path = NULL;
     const char *request_path;
-    char request_buffer[8192];
+    char *request_buffer = NULL;
     unsigned char read_buf[1024];
     int request_len;
+    size_t request_cap;
     int ret = 0;
     int rc = -1;
     const char *port = "443";
@@ -1142,7 +1698,14 @@ static int post_https_body(const char *webhook, const char *ctype,
         }
     }
 
-    request_len = snprintf(request_buffer, sizeof(request_buffer),
+    request_cap = strlen(payload) + strlen(host) + strlen(request_path) +
+                  strlen(ctype) + 512;
+    request_buffer = (char *)malloc(request_cap);
+    if (!request_buffer) {
+        engine_log("[WEBHOOK] request buffer allocation failed");
+        goto cleanup_tls;
+    }
+    request_len = snprintf(request_buffer, request_cap,
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: alice-pusher-bot/1.0\r\n"
@@ -1152,7 +1715,7 @@ static int post_https_body(const char *webhook, const char *ctype,
         "\r\n"
         "%s",
         request_path, host, ctype, strlen(payload), payload);
-    if (request_len <= 0 || request_len >= (int)sizeof(request_buffer)) {
+    if (request_len <= 0 || (size_t)request_len >= request_cap) {
         engine_log("[WEBHOOK] request too large");
         goto cleanup_tls;
     }
@@ -1180,6 +1743,7 @@ static int post_https_body(const char *webhook, const char *ctype,
     rc = 0;
 
 cleanup_tls:
+    free(request_buffer);
     mbedtls_net_free(&server_fd);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
@@ -1436,7 +2000,7 @@ static int smtp_send_message(const char *host, const char *port,
     char port_buf[16];
     char command[768];
     char encoded[512];
-    char data[8192];
+    char *data = NULL;
     const char *mode = security && security[0] ? security : "starttls";
     const char *connect_port = port;
     int data_len;
@@ -1460,6 +2024,11 @@ static int smtp_send_message(const char *host, const char *port,
                  strcmp(mode, "tls") == 0 ? "465" :
                  (strcmp(mode, "plain") == 0 ? "25" : "587"));
         connect_port = port_buf;
+    }
+    data = (char *)malloc(SMS_PAYLOAD_MAX);
+    if (!data) {
+        engine_log("[SMTP] message buffer allocation failed");
+        return -1;
     }
 
     memset(&conn, 0, sizeof(conn));
@@ -1519,7 +2088,7 @@ static int smtp_send_message(const char *host, const char *port,
         goto cleanup;
     if (smtp_command(&conn, "DATA\r\n", 300, 399) < 0)
         goto cleanup;
-    data_len = smtp_build_data(data, sizeof(data), from, to, txt);
+    data_len = smtp_build_data(data, SMS_PAYLOAD_MAX, from, to, txt);
     if (data_len < 0 || smtp_conn_write(&conn, (unsigned char *)data,
                                         (size_t)data_len) < 0)
         goto cleanup;
@@ -1529,6 +2098,7 @@ static int smtp_send_message(const char *host, const char *port,
     rc = 0;
 
 cleanup:
+    free(data);
     if (conn.tls_active)
         mbedtls_ssl_close_notify(&conn.ssl);
     mbedtls_net_free(&conn.net);
@@ -1542,54 +2112,130 @@ cleanup:
 int alice_engine_send_webhook_msg(const char *webhook, const char *platform,
                                   const char *txt, const char *custom_ctype,
                                   const char *custom_body) {
-    char payload[4096];
+    char *payload;
     char ctype[160];
     const char *p = platform && platform[0] ? platform : "dingtalk";
+    int rc;
 
     if (!webhook || !webhook[0] || !txt)
         return -1;
-    if (alice_engine_build_webhook_payload(webhook, p, txt, custom_ctype, custom_body,
-                              payload, sizeof(payload),
-                              ctype, sizeof(ctype)) < 0)
+    payload = (char *)malloc(SMS_PAYLOAD_MAX);
+    if (!payload)
         return -1;
-    return post_https_body(webhook, ctype, payload, p);
+    if (alice_engine_build_webhook_payload(webhook, p, txt, custom_ctype, custom_body,
+                              payload, SMS_PAYLOAD_MAX,
+                              ctype, sizeof(ctype)) < 0)
+        rc = -1;
+    else
+        rc = post_https_body(webhook, ctype, payload, p);
+    free(payload);
+    return rc;
 }
 
-static void append_message_text(char *out, size_t outsz, const char *text) {
+static int append_message_text(char *out, size_t outsz, const char *text) {
     size_t used;
-    size_t left;
+    size_t text_len;
 
     if (!out || outsz == 0 || !text || !text[0])
-        return;
+        return 0;
     used = strlen(out);
-    if (used >= outsz - 1)
-        return;
-    left = outsz - used - 1;
-    strncat(out, text, left);
+    text_len = strlen(text);
+    if (used >= outsz || text_len >= outsz - used)
+        return -1;
+    memcpy(out + used, text, text_len + 1);
+    return 0;
+}
+
+int alice_engine_build_push_message_checked(char *out, size_t outsz,
+                                            const char *headtxt,
+                                            const char *body,
+                                            const char *tailtxt) {
+    if (!out || outsz == 0)
+        return -1;
+    out[0] = 0;
+    if (headtxt && headtxt[0]) {
+        if (append_message_text(out, outsz, headtxt) < 0 ||
+            append_message_text(out, outsz, "\n") < 0)
+            return -1;
+    }
+    if (append_message_text(out, outsz, body) < 0)
+        return -1;
+    if (tailtxt && tailtxt[0]) {
+        if (out[0] && append_message_text(out, outsz, "\n") < 0)
+            return -1;
+        if (append_message_text(out, outsz, tailtxt) < 0)
+            return -1;
+    }
+    return 0;
 }
 
 void alice_engine_build_push_message(char *out, size_t outsz,
-                               const char *headtxt,
-                               const char *body,
-                               const char *tailtxt) {
-    if (!out || outsz == 0)
+                                     const char *headtxt,
+                                     const char *body,
+                                     const char *tailtxt) {
+    (void)alice_engine_build_push_message_checked(out, outsz, headtxt,
+                                                  body, tailtxt);
+}
+
+static void push_decoded_sms(const sms_info_t *info, const char *text,
+                             const alice_engine_push_target_t *targets,
+                             size_t target_count) {
+    char msg[SMS_PUSH_MESSAGE_MAX];
+    int n;
+
+    if (!info || !text || !text[0])
         return;
-    out[0] = 0;
-    if (headtxt && headtxt[0]) {
-        append_message_text(out, outsz, headtxt);
-        append_message_text(out, outsz, "\n");
+    if (is_sms_uniq_in_queue(info->sender, info->timestamp, text))
+        return;
+    add_sms_uniq_to_queue(info->sender, info->timestamp, text);
+    n = snprintf(msg, sizeof(msg),
+                 "[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
+                 info->smsc[0] ? info->smsc : "N/A",
+                 info->sender[0] ? info->sender : "N/A",
+                 info->timestamp[0] ? info->timestamp : "N/A", text);
+    if (n < 0 || n >= (int)sizeof(msg)) {
+        engine_log("[PDU] decoded message exceeds push buffer");
+        return;
     }
-    append_message_text(out, outsz, body);
-    if (tailtxt && tailtxt[0]) {
-        if (out[0])
-            append_message_text(out, outsz, "\n");
-        append_message_text(out, outsz, tailtxt);
+
+    /* 手机号和前后缀属于任务，分别生成每个任务的最终文本。 */
+    {
+        size_t i;
+        int configured = 0;
+        int failed = 0;
+        for (i = 0; i < target_count; i++) {
+            const alice_engine_push_target_t *target = &targets[i];
+            char target_body[SMS_PUSH_MESSAGE_MAX];
+            char final_msg[SMS_PUSH_MESSAGE_MAX];
+            const char *num;
+
+            if (!target->enabled)
+                continue;
+            configured = 1;
+            num = target->num && target->num[0] ? target->num :
+                  device_msisdn[0] ? device_msisdn : "N/A";
+            n = snprintf(target_body, sizeof(target_body),
+                         "接收短信设备手机号:%s\n%s", num, msg);
+            if (n < 0 || n >= (int)sizeof(target_body) ||
+                alice_engine_build_push_message_checked(
+                    final_msg, sizeof(final_msg), target->headtxt,
+                    target_body, target->tailtxt) < 0) {
+                engine_log("[PDU][%s] formatted message exceeds push buffer",
+                           push_target_name(target, i));
+                failed = 1;
+                continue;
+            }
+            if (send_one_target_message(target, i, final_msg) < 0)
+                failed = 1;
+        }
+        if (!configured || failed)
+            engine_log("[PDU] one or more target deliveries failed");
     }
 }
 
 static void process_strace_line_for_sms(
     const char *line, const alice_engine_push_target_t *targets,
-    size_t target_count, const char *headtxt, const char *tailtxt) {
+    size_t target_count, int long_sms_reassembly) {
     char local[MAX_BUFFER_LEN];
     strncpy(local, line, sizeof(local) - 1);
     local[sizeof(local) - 1] = 0;
@@ -1632,24 +2278,21 @@ static void process_strace_line_for_sms(
                 }
                 if (valid_pdu) {
                     sms_info_t info;
-                    decode_pdu(pdu_trim, &info);
-                    size_t textlen = strlen(info.text);
-                    if (textlen > 0) {
-                        if (!is_sms_uniq_in_queue(info.sender, info.timestamp, info.text)) {
-                            add_sms_uniq_to_queue(info.sender, info.timestamp, info.text);
-                            char msg[1024];
-                            char final_msg[2048];
-                            snprintf(msg, sizeof(msg),
-                                "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:%s\n发件人:%s\n时间戳:%s\n短信内容:%s",
-                                device_msisdn[0] ? device_msisdn : "N/A",
-                                info.smsc[0] ? info.smsc : "N/A",
-                                info.sender[0] ? info.sender : "N/A",
-                                info.timestamp[0] ? info.timestamp : "N/A",
-                                info.text);
-                            alice_engine_build_push_message(final_msg, sizeof(final_msg),
-                                               headtxt, msg, tailtxt);
-                            alice_engine_send_target_list(targets, target_count,
-                                                          final_msg);
+                    if (decode_pdu(pdu_trim, &info) < 0) {
+                        engine_log("[PDU] decode failed");
+                        return;
+                    }
+                    if (info.text[0]) {
+                        if (long_sms_reassembly && info.is_concat) {
+                            char assembled[SMS_CONCAT_MAX_TEXT + 1];
+                            int concat_rc = add_concat_segment(&info, assembled,
+                                                               sizeof(assembled));
+                            if (concat_rc == 1)
+                                push_decoded_sms(&info, assembled, targets,
+                                                 target_count);
+                        } else {
+                            push_decoded_sms(&info, info.text, targets,
+                                             target_count);
                         }
                     }
                 }
