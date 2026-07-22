@@ -6,6 +6,24 @@
 
 #define ALICE_TARGET_MIFI_PATH "/sbin/zte_mifi"
 #define ALICE_TARGET_UFI_PATH "/sbin/zte_ufi"
+#define ALICE_ENGINE_MAX_TARGETS 4
+
+typedef struct {
+    int enabled;
+    const char *name;
+    const char *type;
+    const char *platform;
+    const char *webhook;
+    const char *custom_ctype;
+    const char *custom_body;
+    const char *smtp_host;
+    const char *smtp_port;
+    const char *smtp_user;
+    const char *smtp_password;
+    const char *smtp_from;
+    const char *smtp_to;
+    const char *smtp_security;
+} alice_engine_push_target_t;
 
 typedef struct {
     const char *webhook;
@@ -16,6 +34,15 @@ typedef struct {
     const char *num;
     const char *headtxt;
     const char *tailtxt;
+    const char *smtp_host;
+    const char *smtp_port;
+    const char *smtp_user;
+    const char *smtp_password;
+    const char *smtp_from;
+    const char *smtp_to;
+    const char *smtp_security;
+    const alice_engine_push_target_t *targets;
+    size_t target_count;
 } alice_engine_service_config_t;
 
 typedef void (*alice_engine_log_fn)(void *ctx, const char *line);
@@ -46,6 +73,21 @@ int alice_engine_send_once(const char *webhook,
                            const char *txt,
                            const char *custom_ctype,
                            const char *custom_body);
+int alice_engine_send_targets(const char *webhook,
+                              const char *platform,
+                              const char *txt,
+                              const char *custom_ctype,
+                              const char *custom_body,
+                              const char *smtp_host,
+                              const char *smtp_port,
+                              const char *smtp_user,
+                              const char *smtp_password,
+                              const char *smtp_from,
+                              const char *smtp_to,
+                              const char *smtp_security);
+int alice_engine_send_target_list(const alice_engine_push_target_t *targets,
+                                  size_t target_count,
+                                  const char *txt);
 int alice_engine_start_service(const alice_engine_service_config_t *cfg);
 void alice_engine_stop(void);
 void alice_engine_cleanup_strace_child(const char *target_path);

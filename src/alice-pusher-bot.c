@@ -56,6 +56,10 @@ static void load_device_msisdn_from_nv_show(void);
 static void* strace_thread_func(void* arg);
 static void* pdu_thread_func(void* arg);
 static void engine_log(const char *fmt, ...);
+static int smtp_send_message(const char *host, const char *port,
+                             const char *user, const char *password,
+                             const char *from, const char *to,
+                             const char *security, const char *txt);
 
 // 线程控制变量
 static volatile int threads_running = 1;
@@ -65,12 +69,16 @@ static char device_msisdn[64] = "";
 static alice_engine_log_fn g_log_fn;
 static void *g_log_ctx;
 
-static void process_strace_line_for_sms(const char *line, const char *webhook,
-                                        const char *platform,
-                                        const char *custom_ctype,
-                                        const char *custom_body,
-                                        const char *headtxt,
-                                        const char *tailtxt);
+static void process_strace_line_for_sms(
+    const char *line, const alice_engine_push_target_t *targets,
+    size_t target_count, const char *headtxt, const char *tailtxt);
+
+typedef struct {
+    const alice_engine_push_target_t *targets;
+    size_t target_count;
+    const char *headtxt;
+    const char *tailtxt;
+} pdu_thread_args_t;
 
 typedef struct {
     char lines[STRACE_QUEUE_LINES][MAX_BUFFER_LEN];
@@ -338,20 +346,156 @@ int alice_engine_send_once(const char *webhook,
                                          custom_ctype, custom_body);
 }
 
+static const char *push_target_name(const alice_engine_push_target_t *target,
+                                    size_t index) {
+    if (target && target->name && target->name[0])
+        return target->name;
+    return target && target->type && strcmp(target->type, "email") == 0 ?
+           "邮箱" : index < ALICE_ENGINE_MAX_TARGETS ? "Webhook" : "目标";
+}
+
+int alice_engine_send_target_list(const alice_engine_push_target_t *targets,
+                                  size_t target_count,
+                                  const char *txt) {
+    size_t i;
+    int configured = 0;
+    int failed = 0;
+
+    if (!txt || !targets || target_count > ALICE_ENGINE_MAX_TARGETS)
+        return -1;
+    for (i = 0; i < target_count; i++) {
+        const alice_engine_push_target_t *target = &targets[i];
+        const char *name;
+        int rc = -1;
+
+        if (!target->enabled)
+            continue;
+        configured = 1;
+        name = push_target_name(target, i);
+        if (target->type && strcmp(target->type, "email") == 0) {
+            if (target->smtp_host && target->smtp_host[0] &&
+                target->smtp_from && target->smtp_from[0] &&
+                target->smtp_to && target->smtp_to[0]) {
+                rc = smtp_send_message(target->smtp_host, target->smtp_port,
+                                       target->smtp_user, target->smtp_password,
+                                       target->smtp_from, target->smtp_to,
+                                       target->smtp_security, txt);
+            }
+            if (rc < 0)
+                engine_log("[PUSH][%s] email delivery failed", name);
+            else
+                engine_log("[PUSH][%s] email delivery succeeded", name);
+        } else if (target->webhook && target->webhook[0]) {
+            const char *platform = target->platform && target->platform[0] ?
+                target->platform : alice_engine_detect_platform_from_url(target->webhook);
+            rc = alice_engine_send_webhook_msg(
+                target->webhook, platform, txt,
+                target->custom_ctype, target->custom_body);
+            if (rc < 0)
+                engine_log("[PUSH][%s] webhook delivery failed", name);
+            else
+                engine_log("[PUSH][%s] webhook delivery succeeded", name);
+        } else {
+            engine_log("[PUSH][%s] target configuration is incomplete", name);
+        }
+        if (rc < 0)
+            failed = 1;
+    }
+    return configured && !failed ? 0 : -1;
+}
+
+int alice_engine_send_targets(const char *webhook,
+                              const char *platform,
+                              const char *txt,
+                              const char *custom_ctype,
+                              const char *custom_body,
+                              const char *smtp_host,
+                              const char *smtp_port,
+                              const char *smtp_user,
+                              const char *smtp_password,
+                              const char *smtp_from,
+                              const char *smtp_to,
+                              const char *smtp_security) {
+    alice_engine_push_target_t targets[2];
+    size_t count = 0;
+
+    memset(targets, 0, sizeof(targets));
+    if (webhook && webhook[0]) {
+        targets[count].enabled = 1;
+        targets[count].name = "Webhook";
+        targets[count].type = "webhook";
+        targets[count].platform = platform;
+        targets[count].webhook = webhook;
+        targets[count].custom_ctype = custom_ctype;
+        targets[count].custom_body = custom_body;
+        count++;
+    }
+    if (smtp_host && smtp_host[0] && smtp_from && smtp_from[0] &&
+        smtp_to && smtp_to[0] && count < 2) {
+        targets[count].enabled = 1;
+        targets[count].name = "邮箱";
+        targets[count].type = "email";
+        targets[count].smtp_host = smtp_host;
+        targets[count].smtp_port = smtp_port;
+        targets[count].smtp_user = smtp_user;
+        targets[count].smtp_password = smtp_password;
+        targets[count].smtp_from = smtp_from;
+        targets[count].smtp_to = smtp_to;
+        targets[count].smtp_security = smtp_security;
+        count++;
+    }
+    return alice_engine_send_target_list(targets, count, txt);
+}
+
 int alice_engine_start_service(const alice_engine_service_config_t *cfg) {
-    const char *platform;
     const char *target_path;
     char target_path_buf[256];
-    char *pdu_args[6];
+    alice_engine_push_target_t legacy_targets[2];
+    pdu_thread_args_t pdu_args;
+    const alice_engine_push_target_t *targets;
+    size_t target_count;
 
-    if (!cfg || !cfg->webhook || !cfg->webhook[0]) {
+    if (!cfg || cfg->target_count > ALICE_ENGINE_MAX_TARGETS) {
         errno = EINVAL;
         return -1;
     }
 
-    platform = alice_engine_normalize_platform(cfg->platform && cfg->platform[0] ?
-                                               cfg->platform :
-                                               alice_engine_detect_platform_from_url(cfg->webhook));
+    memset(legacy_targets, 0, sizeof(legacy_targets));
+    targets = cfg->targets;
+    target_count = cfg->target_count;
+    if (!targets || !target_count) {
+        target_count = 0;
+        if (cfg->webhook && cfg->webhook[0]) {
+            legacy_targets[target_count].enabled = 1;
+            legacy_targets[target_count].name = "Webhook";
+            legacy_targets[target_count].type = "webhook";
+            legacy_targets[target_count].platform = cfg->platform;
+            legacy_targets[target_count].webhook = cfg->webhook;
+            legacy_targets[target_count].custom_ctype = cfg->custom_ctype;
+            legacy_targets[target_count].custom_body = cfg->custom_body;
+            target_count++;
+        }
+        if (cfg->smtp_host && cfg->smtp_host[0] && cfg->smtp_from &&
+            cfg->smtp_from[0] && cfg->smtp_to && cfg->smtp_to[0] &&
+            target_count < 2) {
+            legacy_targets[target_count].enabled = 1;
+            legacy_targets[target_count].name = "邮箱";
+            legacy_targets[target_count].type = "email";
+            legacy_targets[target_count].smtp_host = cfg->smtp_host;
+            legacy_targets[target_count].smtp_port = cfg->smtp_port;
+            legacy_targets[target_count].smtp_user = cfg->smtp_user;
+            legacy_targets[target_count].smtp_password = cfg->smtp_password;
+            legacy_targets[target_count].smtp_from = cfg->smtp_from;
+            legacy_targets[target_count].smtp_to = cfg->smtp_to;
+            legacy_targets[target_count].smtp_security = cfg->smtp_security;
+            target_count++;
+        }
+        targets = legacy_targets;
+    }
+    if (!target_count) {
+        errno = EINVAL;
+        return -1;
+    }
     target_path = cfg->target_path && cfg->target_path[0] ?
                   cfg->target_path : TARGET_MIFI_PATH;
     safe_copy(target_path_buf, sizeof(target_path_buf), target_path);
@@ -380,14 +524,12 @@ int alice_engine_start_service(const alice_engine_service_config_t *cfg) {
         engine_log("[ENGINE] failed to create strace thread errno=%d", errno);
         return -1;
     }
-    pdu_args[0] = (char *)cfg->webhook;
-    pdu_args[1] = (char *)platform;
-    pdu_args[2] = (char *)cfg->custom_ctype;
-    pdu_args[3] = (char *)cfg->custom_body;
-    pdu_args[4] = (char *)cfg->headtxt;
-    pdu_args[5] = (char *)cfg->tailtxt;
+    pdu_args.targets = targets;
+    pdu_args.target_count = target_count;
+    pdu_args.headtxt = cfg->headtxt;
+    pdu_args.tailtxt = cfg->tailtxt;
     if (pthread_create(&pdu_thread_id, NULL, pdu_thread_func,
-                       pdu_args) != 0) {
+                       &pdu_args) != 0) {
         engine_log("[ENGINE] failed to create PDU thread errno=%d", errno);
         threads_running = 0;
         pthread_cond_broadcast(&g_strace_queue.cond);
@@ -540,20 +682,13 @@ static void* strace_thread_func(void* arg) {
 
 // PDU处理线程函数
 static void* pdu_thread_func(void* arg) {
-    char** args = (char**)arg;
-    char* webhook = args[0];
-    char* platform = args[1];
-    char* custom_ctype = args[2];
-    char* custom_body = args[3];
-    char* headtxt = args[4];
-    char* tailtxt = args[5];
+    pdu_thread_args_t *args = (pdu_thread_args_t *)arg;
 
     while (threads_running) {
         char line[MAX_BUFFER_LEN];
         if (strace_queue_pop_line(line, sizeof(line), 1000)) {
-            process_strace_line_for_sms(line, webhook, platform,
-                                        custom_ctype, custom_body,
-                                        headtxt, tailtxt);
+            process_strace_line_for_sms(line, args->targets, args->target_count,
+                                        args->headtxt, args->tailtxt);
         }
     }
     return NULL;
@@ -1056,6 +1191,354 @@ cleanup_strings:
     return rc;
 }
 
+typedef struct {
+    mbedtls_net_context net;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    int tls_active;
+} smtp_conn_t;
+
+static int smtp_conn_write(smtp_conn_t *conn, const unsigned char *buf,
+                           size_t len) {
+    size_t sent = 0;
+
+    while (sent < len) {
+        int ret = conn->tls_active ?
+            mbedtls_ssl_write(&conn->ssl, buf + sent, len - sent) :
+            mbedtls_net_send(&conn->net, buf + sent, len - sent);
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+            continue;
+        if (ret <= 0)
+            return -1;
+        sent += (size_t)ret;
+    }
+    return 0;
+}
+
+static int smtp_conn_read(smtp_conn_t *conn, unsigned char *buf, size_t len) {
+    for (;;) {
+        int ret = conn->tls_active ?
+            mbedtls_ssl_read(&conn->ssl, buf, len) :
+            mbedtls_net_recv(&conn->net, buf, len);
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+            continue;
+        return ret;
+    }
+}
+
+static int smtp_send_text(smtp_conn_t *conn, const char *text) {
+    if (!text)
+        return -1;
+    return smtp_conn_write(conn, (const unsigned char *)text, strlen(text));
+}
+
+static int smtp_read_response(smtp_conn_t *conn) {
+    char line[512];
+    size_t used = 0;
+    int first_code = 0;
+
+    for (;;) {
+        unsigned char ch;
+        int ret = smtp_conn_read(conn, &ch, 1);
+        int code;
+
+        if (ret != 1)
+            return -1;
+        if (ch != '\n') {
+            if (used + 1 >= sizeof(line))
+                return -1;
+            line[used++] = (char)ch;
+            continue;
+        }
+        if (used && line[used - 1] == '\r')
+            used--;
+        line[used] = 0;
+        if (used < 3 || !isdigit((unsigned char)line[0]) ||
+            !isdigit((unsigned char)line[1]) ||
+            !isdigit((unsigned char)line[2]))
+            return -1;
+        code = (line[0] - '0') * 100 + (line[1] - '0') * 10 +
+               (line[2] - '0');
+        if (!first_code)
+            first_code = code;
+        if (used < 4 || line[3] != '-') {
+            engine_log("[SMTP] response=%d", first_code);
+            return first_code;
+        }
+        used = 0;
+    }
+}
+
+static int smtp_expect(smtp_conn_t *conn, int min_code, int max_code) {
+    int code = smtp_read_response(conn);
+    return code >= min_code && code <= max_code ? 0 : -1;
+}
+
+static int smtp_command(smtp_conn_t *conn, const char *command,
+                        int min_code, int max_code) {
+    if (smtp_send_text(conn, command) < 0)
+        return -1;
+    return smtp_expect(conn, min_code, max_code);
+}
+
+static int smtp_base64_encode(const unsigned char *src, size_t src_len,
+                              char *dst, size_t dst_sz) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    size_t used = 0;
+
+    while (i < src_len) {
+        unsigned int value = (unsigned int)src[i++] << 16;
+        int count = 1;
+        if (i < src_len) {
+            value |= (unsigned int)src[i++] << 8;
+            count++;
+        }
+        if (i < src_len) {
+            value |= src[i++];
+            count++;
+        }
+        if (used + 4 >= dst_sz)
+            return -1;
+        dst[used++] = table[(value >> 18) & 0x3f];
+        dst[used++] = table[(value >> 12) & 0x3f];
+        dst[used++] = count > 1 ? table[(value >> 6) & 0x3f] : '=';
+        dst[used++] = count > 2 ? table[value & 0x3f] : '=';
+    }
+    if (used + 1 > dst_sz)
+        return -1;
+    dst[used] = 0;
+    return 0;
+}
+
+static int smtp_enable_tls(smtp_conn_t *conn, const char *host) {
+    int ret;
+    const char *pers = "alice-pusher-smtp";
+
+    if ((ret = mbedtls_ctr_drbg_seed(&conn->ctr_drbg,
+                                     mbedtls_entropy_func,
+                                     &conn->entropy,
+                                     (const unsigned char *)pers,
+                                     strlen(pers))) != 0) {
+        print_mbedtls_error(ret, "smtp ctr_drbg_seed");
+        return -1;
+    }
+    if ((ret = mbedtls_ssl_config_defaults(&conn->conf,
+                                           MBEDTLS_SSL_IS_CLIENT,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        print_mbedtls_error(ret, "smtp ssl_config_defaults");
+        return -1;
+    }
+    mbedtls_ssl_conf_authmode(&conn->conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&conn->conf, mbedtls_ctr_drbg_random,
+                         &conn->ctr_drbg);
+    if ((ret = mbedtls_ssl_setup(&conn->ssl, &conn->conf)) != 0) {
+        print_mbedtls_error(ret, "smtp ssl_setup");
+        return -1;
+    }
+    if (host && host[0] && mbedtls_ssl_set_hostname(&conn->ssl, host) != 0) {
+        engine_log("[SMTP] invalid server hostname");
+        return -1;
+    }
+    mbedtls_ssl_set_bio(&conn->ssl, &conn->net, mbedtls_net_send,
+                        mbedtls_net_recv, NULL);
+    while ((ret = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            print_mbedtls_error(ret, "smtp ssl_handshake");
+            return -1;
+        }
+    }
+    conn->tls_active = 1;
+    return 0;
+}
+
+static int smtp_append(char *buf, size_t bufsz, size_t *used,
+                       const char *src, size_t len) {
+    if (!buf || !used || *used > bufsz || len > bufsz - *used)
+        return -1;
+    memcpy(buf + *used, src, len);
+    *used += len;
+    return 0;
+}
+
+static int smtp_build_data(char *data, size_t data_sz, const char *from,
+                           const char *to, const char *txt) {
+    size_t used = 0;
+    size_t i;
+    int line_start = 1;
+    int n;
+
+    n = snprintf(data, data_sz,
+                 "From: %s\r\n"
+                 "To: %s\r\n"
+                 "Subject: Alice Pusher SMS\r\n"
+                 "MIME-Version: 1.0\r\n"
+                 "Content-Type: text/plain; charset=UTF-8\r\n"
+                 "Content-Transfer-Encoding: 8bit\r\n"
+                 "\r\n",
+                 from, to);
+    if (n <= 0 || (size_t)n >= data_sz)
+        return -1;
+    used = (size_t)n;
+    for (i = 0; txt && txt[i]; i++) {
+        char ch = txt[i];
+        if (line_start && ch == '.') {
+            if (smtp_append(data, data_sz, &used, ".", 1) < 0)
+                return -1;
+        }
+        if (ch == '\r') {
+            if (txt[i + 1] == '\n')
+                i++;
+            if (smtp_append(data, data_sz, &used, "\r\n", 2) < 0)
+                return -1;
+            line_start = 1;
+        } else if (ch == '\n') {
+            if (smtp_append(data, data_sz, &used, "\r\n", 2) < 0)
+                return -1;
+            line_start = 1;
+        } else {
+            if (smtp_append(data, data_sz, &used, &ch, 1) < 0)
+                return -1;
+            line_start = 0;
+        }
+    }
+    if (!line_start && smtp_append(data, data_sz, &used, "\r\n", 2) < 0)
+        return -1;
+    if (smtp_append(data, data_sz, &used, ".\r\n", 3) < 0)
+        return -1;
+    return (int)used;
+}
+
+static int smtp_value_safe(const char *value) {
+    const unsigned char *p = (const unsigned char *)value;
+    if (!value || !value[0])
+        return 0;
+    while (*p) {
+        if (*p == '\r' || *p == '\n' || *p < 0x20 || *p == 0x7f)
+            return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int smtp_send_message(const char *host, const char *port,
+                             const char *user, const char *password,
+                             const char *from, const char *to,
+                             const char *security, const char *txt) {
+    smtp_conn_t conn;
+    char port_buf[16];
+    char command[768];
+    char encoded[512];
+    char data[8192];
+    const char *mode = security && security[0] ? security : "starttls";
+    const char *connect_port = port;
+    int data_len;
+    int code;
+    int rc = -1;
+
+    if (!smtp_value_safe(host) || !smtp_value_safe(from) ||
+        !smtp_value_safe(to) ||
+        (user && user[0] && !smtp_value_safe(user)) ||
+        (password && password[0] && !smtp_value_safe(password))) {
+        engine_log("[SMTP] invalid configuration value");
+        return -1;
+    }
+    if (strcmp(mode, "plain") != 0 && strcmp(mode, "starttls") != 0 &&
+        strcmp(mode, "tls") != 0) {
+        engine_log("[SMTP] unsupported security mode=%s", mode);
+        return -1;
+    }
+    if (!connect_port || !connect_port[0]) {
+        snprintf(port_buf, sizeof(port_buf), "%s",
+                 strcmp(mode, "tls") == 0 ? "465" :
+                 (strcmp(mode, "plain") == 0 ? "25" : "587"));
+        connect_port = port_buf;
+    }
+
+    memset(&conn, 0, sizeof(conn));
+    mbedtls_net_init(&conn.net);
+    mbedtls_ssl_init(&conn.ssl);
+    mbedtls_ssl_config_init(&conn.conf);
+    mbedtls_entropy_init(&conn.entropy);
+    mbedtls_ctr_drbg_init(&conn.ctr_drbg);
+    if (mbedtls_net_connect(&conn.net, host, connect_port,
+                            MBEDTLS_NET_PROTO_TCP) != 0) {
+        engine_log("[SMTP] connect failed host=%s port=%s", host, connect_port);
+        goto cleanup;
+    }
+    engine_log("[SMTP] connected host=%s port=%s security=%s",
+               host, connect_port, mode);
+    if (strcmp(mode, "tls") == 0 && smtp_enable_tls(&conn, host) < 0)
+        goto cleanup;
+    if (smtp_expect(&conn, 200, 399) < 0)
+        goto cleanup;
+    if (smtp_send_text(&conn, "EHLO alice-pusher\r\n") < 0)
+        goto cleanup;
+    code = smtp_read_response(&conn);
+    if (code < 200 || code > 299) {
+        if (smtp_command(&conn, "HELO alice-pusher\r\n", 200, 299) < 0)
+            goto cleanup;
+    }
+    if (strcmp(mode, "starttls") == 0) {
+        if (smtp_command(&conn, "STARTTLS\r\n", 200, 299) < 0)
+            goto cleanup;
+        if (smtp_enable_tls(&conn, host) < 0)
+            goto cleanup;
+        if (smtp_command(&conn, "EHLO alice-pusher\r\n", 200, 299) < 0)
+            goto cleanup;
+    }
+    if (user && user[0]) {
+        if (smtp_command(&conn, "AUTH LOGIN\r\n", 300, 399) < 0)
+            goto cleanup;
+        if (smtp_base64_encode((const unsigned char *)user, strlen(user),
+                               encoded, sizeof(encoded)) < 0)
+            goto cleanup;
+        snprintf(command, sizeof(command), "%s\r\n", encoded);
+        if (smtp_command(&conn, command, 300, 399) < 0)
+            goto cleanup;
+        if (smtp_base64_encode((const unsigned char *)(password ? password : ""),
+                               password ? strlen(password) : 0,
+                               encoded, sizeof(encoded)) < 0)
+            goto cleanup;
+        snprintf(command, sizeof(command), "%s\r\n", encoded);
+        if (smtp_command(&conn, command, 200, 399) < 0)
+            goto cleanup;
+    }
+    snprintf(command, sizeof(command), "MAIL FROM:<%s>\r\n", from);
+    if (smtp_command(&conn, command, 200, 299) < 0)
+        goto cleanup;
+    snprintf(command, sizeof(command), "RCPT TO:<%s>\r\n", to);
+    if (smtp_command(&conn, command, 200, 299) < 0)
+        goto cleanup;
+    if (smtp_command(&conn, "DATA\r\n", 300, 399) < 0)
+        goto cleanup;
+    data_len = smtp_build_data(data, sizeof(data), from, to, txt);
+    if (data_len < 0 || smtp_conn_write(&conn, (unsigned char *)data,
+                                        (size_t)data_len) < 0)
+        goto cleanup;
+    if (smtp_expect(&conn, 200, 299) < 0)
+        goto cleanup;
+    smtp_send_text(&conn, "QUIT\r\n");
+    rc = 0;
+
+cleanup:
+    if (conn.tls_active)
+        mbedtls_ssl_close_notify(&conn.ssl);
+    mbedtls_net_free(&conn.net);
+    mbedtls_ssl_free(&conn.ssl);
+    mbedtls_ssl_config_free(&conn.conf);
+    mbedtls_ctr_drbg_free(&conn.ctr_drbg);
+    mbedtls_entropy_free(&conn.entropy);
+    return rc;
+}
+
 int alice_engine_send_webhook_msg(const char *webhook, const char *platform,
                                   const char *txt, const char *custom_ctype,
                                   const char *custom_body) {
@@ -1104,12 +1587,9 @@ void alice_engine_build_push_message(char *out, size_t outsz,
     }
 }
 
-static void process_strace_line_for_sms(const char *line, const char *webhook,
-                                        const char *platform,
-                                        const char *custom_ctype,
-                                        const char *custom_body,
-                                        const char *headtxt,
-                                        const char *tailtxt) {
+static void process_strace_line_for_sms(
+    const char *line, const alice_engine_push_target_t *targets,
+    size_t target_count, const char *headtxt, const char *tailtxt) {
     char local[MAX_BUFFER_LEN];
     strncpy(local, line, sizeof(local) - 1);
     local[sizeof(local) - 1] = 0;
@@ -1168,8 +1648,8 @@ static void process_strace_line_for_sms(const char *line, const char *webhook,
                                 info.text);
                             alice_engine_build_push_message(final_msg, sizeof(final_msg),
                                                headtxt, msg, tailtxt);
-                            alice_engine_send_webhook_msg(webhook, platform, final_msg,
-                                             custom_ctype, custom_body);
+                            alice_engine_send_target_list(targets, target_count,
+                                                          final_msg);
                         }
                     }
                 }

@@ -2,7 +2,14 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-TOOLCHAIN_DIR="$ROOT_DIR/toolchain/host/usr/bin"
+ALICE_BUILDROOT_OUTPUT="${ALICE_BUILDROOT_OUTPUT:-$ROOT_DIR/../alice-buildroot/output-target}"
+if [ -x "$ALICE_BUILDROOT_OUTPUT/host/usr/bin/arm-buildroot-linux-uclibcgnueabi-gcc" ]; then
+	TOOLCHAIN_DIR="$ALICE_BUILDROOT_OUTPUT/host/usr/bin"
+	TOOLCHAIN_SOURCE="$ALICE_BUILDROOT_OUTPUT"
+else
+	TOOLCHAIN_DIR="$ROOT_DIR/toolchain/host/usr/bin"
+	TOOLCHAIN_SOURCE="$ROOT_DIR/toolchain"
+fi
 CROSS_PREFIX="$TOOLCHAIN_DIR/arm-buildroot-linux-uclibcgnueabi-"
 CC="${CC:-${CROSS_PREFIX}gcc}"
 STRIP="${STRIP:-${CROSS_PREFIX}strip}"
@@ -98,6 +105,8 @@ need_file "$SPONSOR_SRC"
 need_file "$MBEDTLS_DIR/include/mbedtls/ssl.h"
 
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+echo "使用工具链：$CC"
+echo "工具链 sysroot：$TOOLCHAIN_SOURCE"
 python3 "$EMBED_ASSET" "$AVATAR_SRC" "$BUILD_DIR/avatar_asset.h" avatar_image image/jpeg
 python3 "$EMBED_ASSET" "$SPONSOR_SRC" "$BUILD_DIR/sponsor_asset.h" sponsor_image image/jpeg
 

@@ -44,6 +44,11 @@
 #define PUSHER_PATH_SH_MARKER "/tmp/alice_pusher_path_sh_started"
 #define PUSHER_AUTOSTART_BEGIN "# alice-pusher-bot path_sh begin"
 #define PUSHER_AUTOSTART_END "# alice-pusher-bot path_sh end"
+#define DELIVERY_WEBHOOK "webhook"
+#define DELIVERY_EMAIL "email"
+#define TARGET_TYPE_WEBHOOK "webhook"
+#define TARGET_TYPE_EMAIL "email"
+#define TARGET_NAME_MAX 64
 #define PERSIST_RESERVE_BYTES (16UL * 1024UL)
 #define LEGACY_RUN_PATH USERDATA_DIR "/alice-pusher-bot.run"
 #define LEGACY_BIN_PATH USERDATA_DIR "/alice-pusher-bot"
@@ -64,8 +69,30 @@ static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int run_webui(const char *self_path, int port);
 static void json_escape(char *out, size_t outsz, const char *in);
 static void safe_copy(char *dst, size_t dstsz, const char *src);
+static void config_escape(char *out, size_t outsz, const char *in);
+static void config_unescape(char *out, size_t outsz, const char *in);
 
 typedef struct {
+    int enabled;
+    char name[TARGET_NAME_MAX];
+    char type[16];
+    char webhook[1024];
+    char platform[32];
+    char custom_ctype[128];
+    char custom_body[2048];
+    char smtp_host[256];
+    char smtp_port[16];
+    char smtp_user[256];
+    char smtp_password[256];
+    char smtp_from[256];
+    char smtp_to[256];
+    char smtp_security[16];
+} web_push_target_t;
+
+typedef struct {
+    web_push_target_t targets[ALICE_ENGINE_MAX_TARGETS];
+    int target_count;
+    char delivery[16];
     char webhook[1024];
     char platform[32];
     char target_mode[32];
@@ -75,6 +102,13 @@ typedef struct {
     char num[128];
     char headtxt[256];
     char tailtxt[256];
+    char smtp_host[256];
+    char smtp_port[16];
+    char smtp_user[256];
+    char smtp_password[256];
+    char smtp_from[256];
+    char smtp_to[256];
+    char smtp_security[16];
     int port;
 } web_config_t;
 
@@ -103,8 +137,92 @@ static void safe_copy(char *dst, size_t dstsz, const char *src) {
     dst[dstsz - 1] = 0;
 }
 
+static int email_configured(const web_config_t *cfg);
+static const char *normalize_smtp_security(const char *security);
+
 static const char *normalize_platform(const char *platform) {
     return alice_engine_normalize_platform(platform);
+}
+
+static const char *normalize_delivery(const char *delivery) {
+    return delivery && strcmp(delivery, DELIVERY_EMAIL) == 0 ?
+           DELIVERY_EMAIL : DELIVERY_WEBHOOK;
+}
+
+static const char *normalize_target_type(const char *type) {
+    return type && strcmp(type, TARGET_TYPE_EMAIL) == 0 ?
+           TARGET_TYPE_EMAIL : TARGET_TYPE_WEBHOOK;
+}
+
+static int target_is_email(const web_push_target_t *target) {
+    return target && strcmp(normalize_target_type(target->type),
+                            TARGET_TYPE_EMAIL) == 0;
+}
+
+static void init_push_target(web_push_target_t *target, int index) {
+    if (!target) return;
+    memset(target, 0, sizeof(*target));
+    snprintf(target->name, sizeof(target->name), "目标 %d", index + 1);
+    safe_copy(target->type, sizeof(target->type), TARGET_TYPE_WEBHOOK);
+    safe_copy(target->platform, sizeof(target->platform), "dingtalk");
+    safe_copy(target->custom_ctype, sizeof(target->custom_ctype),
+              "application/json;charset=utf-8");
+    safe_copy(target->custom_body, sizeof(target->custom_body),
+              "{\"text\":\"{{json_text}}\"}");
+    safe_copy(target->smtp_port, sizeof(target->smtp_port), "587");
+    safe_copy(target->smtp_security, sizeof(target->smtp_security), "starttls");
+}
+
+static void normalize_push_target(web_push_target_t *target, int index) {
+    if (!target) return;
+    safe_copy(target->type, sizeof(target->type), normalize_target_type(target->type));
+    safe_copy(target->platform, sizeof(target->platform),
+              normalize_platform(target->platform));
+    safe_copy(target->smtp_security, sizeof(target->smtp_security),
+              normalize_smtp_security(target->smtp_security));
+    if (!target->name[0])
+        snprintf(target->name, sizeof(target->name), "目标 %d", index + 1);
+    if (!target->custom_ctype[0])
+        safe_copy(target->custom_ctype, sizeof(target->custom_ctype),
+                  "application/json;charset=utf-8");
+    if (!target->custom_body[0])
+        safe_copy(target->custom_body, sizeof(target->custom_body),
+                  "{\"text\":\"{{json_text}}\"}");
+    if (!target->smtp_port[0])
+        safe_copy(target->smtp_port, sizeof(target->smtp_port), "587");
+    target->enabled = target->enabled ? 1 : 0;
+}
+
+static void clear_target_inactive_fields(web_push_target_t *target) {
+    if (!target) return;
+    if (target_is_email(target)) {
+        target->webhook[0] = 0;
+        target->custom_ctype[0] = 0;
+        target->custom_body[0] = 0;
+    } else {
+        target->smtp_host[0] = 0;
+        target->smtp_user[0] = 0;
+        target->smtp_password[0] = 0;
+        target->smtp_from[0] = 0;
+        target->smtp_to[0] = 0;
+    }
+}
+
+static int target_configured(const web_push_target_t *target) {
+    if (!target) return 0;
+    if (target_is_email(target))
+        return target->smtp_host[0] && target->smtp_from[0] && target->smtp_to[0];
+    return target->webhook[0] != 0;
+}
+
+static int enabled_target_count(const web_config_t *cfg) {
+    int i;
+    int count = 0;
+    if (!cfg) return 0;
+    for (i = 0; i < cfg->target_count && i < ALICE_ENGINE_MAX_TARGETS; i++)
+        if (cfg->targets[i].enabled && target_configured(&cfg->targets[i]))
+            count++;
+    return count;
 }
 
 static const char *platform_label(const char *platform) {
@@ -120,9 +238,180 @@ static const char *platform_label(const char *platform) {
 }
 
 static const char *configured_platform_label(const web_config_t *cfg) {
-    if (!cfg || !cfg->webhook[0])
-        return "未配置";
-    return platform_label(cfg->platform);
+    int i;
+    int enabled = 0;
+    const web_push_target_t *only = NULL;
+
+    if (!cfg) return "未配置";
+    for (i = 0; i < cfg->target_count && i < ALICE_ENGINE_MAX_TARGETS; i++) {
+        if (cfg->targets[i].enabled && target_configured(&cfg->targets[i])) {
+            enabled++;
+            only = &cfg->targets[i];
+        }
+    }
+    if (enabled == 0) return "未配置";
+    if (enabled > 1) return "多平台";
+    return target_is_email(only) ? "邮箱" : platform_label(only->platform);
+}
+
+static const char *configured_delivery_mode(const web_config_t *cfg) {
+    int i;
+    int webhook_count = 0;
+    int email_count = 0;
+
+    if (!cfg) return "none";
+    for (i = 0; i < cfg->target_count && i < ALICE_ENGINE_MAX_TARGETS; i++) {
+        if (!cfg->targets[i].enabled || !target_configured(&cfg->targets[i]))
+            continue;
+        if (target_is_email(&cfg->targets[i])) email_count++;
+        else webhook_count++;
+    }
+    if (webhook_count && email_count) return "multiple";
+    if (email_count) return "email";
+    if (webhook_count) return "webhook";
+    return "none";
+}
+
+static const char *normalize_smtp_security(const char *security) {
+    if (security && strcmp(security, "plain") == 0)
+        return "plain";
+    if (security && strcmp(security, "tls") == 0)
+        return "tls";
+    return "starttls";
+}
+
+static int email_configured(const web_config_t *cfg) {
+    return cfg && cfg->smtp_host[0] && cfg->smtp_from[0] && cfg->smtp_to[0];
+}
+
+static int any_target_configured(const web_config_t *cfg) {
+    return enabled_target_count(cfg) > 0;
+}
+
+static size_t build_engine_target_list(const web_config_t *cfg,
+                                       alice_engine_push_target_t *out,
+                                       size_t out_count) {
+    size_t i;
+    size_t count;
+
+    if (!cfg || !out || out_count == 0) return 0;
+    count = cfg->target_count;
+    if (count > out_count) count = out_count;
+    memset(out, 0, out_count * sizeof(*out));
+    for (i = 0; i < count; i++) {
+        const web_push_target_t *target = &cfg->targets[i];
+        out[i].enabled = target->enabled;
+        out[i].name = target->name;
+        out[i].type = target->type;
+        out[i].platform = target->platform;
+        out[i].webhook = target->webhook;
+        out[i].custom_ctype = target->custom_ctype;
+        out[i].custom_body = target->custom_body;
+        out[i].smtp_host = target->smtp_host;
+        out[i].smtp_port = target->smtp_port;
+        out[i].smtp_user = target->smtp_user;
+        out[i].smtp_password = target->smtp_password;
+        out[i].smtp_from = target->smtp_from;
+        out[i].smtp_to = target->smtp_to;
+        out[i].smtp_security = target->smtp_security;
+    }
+    return count;
+}
+
+static int target_key_parts(const char *key, int *index, const char **field) {
+    char *end;
+    long value;
+
+    if (!key || strncmp(key, "target_", 7) != 0)
+        return 0;
+    errno = 0;
+    value = strtol(key + 7, &end, 10);
+    if (errno || end == key + 7 || *end != '_' ||
+        value < 0 || value >= ALICE_ENGINE_MAX_TARGETS || !end[1])
+        return 0;
+    if (index) *index = (int)value;
+    if (field) *field = end + 1;
+    return 1;
+}
+
+static int load_target_field(web_push_target_t *target, const char *field,
+                             const char *value) {
+    long enabled;
+    char *end;
+
+    if (!target || !field || !value) return 0;
+    if (strcmp(field, "enabled") == 0) {
+        errno = 0;
+        enabled = strtol(value, &end, 10);
+        target->enabled = !errno && end != value && enabled != 0;
+    } else if (strcmp(field, "name") == 0)
+        config_unescape(target->name, sizeof(target->name), value);
+    else if (strcmp(field, "type") == 0)
+        safe_copy(target->type, sizeof(target->type), normalize_target_type(value));
+    else if (strcmp(field, "platform") == 0)
+        safe_copy(target->platform, sizeof(target->platform), normalize_platform(value));
+    else if (strcmp(field, "webhook") == 0)
+        config_unescape(target->webhook, sizeof(target->webhook), value);
+    else if (strcmp(field, "custom_ctype") == 0)
+        config_unescape(target->custom_ctype, sizeof(target->custom_ctype), value);
+    else if (strcmp(field, "custom_body") == 0)
+        config_unescape(target->custom_body, sizeof(target->custom_body), value);
+    else if (strcmp(field, "smtp_host") == 0)
+        config_unescape(target->smtp_host, sizeof(target->smtp_host), value);
+    else if (strcmp(field, "smtp_port") == 0)
+        config_unescape(target->smtp_port, sizeof(target->smtp_port), value);
+    else if (strcmp(field, "smtp_user") == 0)
+        config_unescape(target->smtp_user, sizeof(target->smtp_user), value);
+    else if (strcmp(field, "smtp_password") == 0)
+        config_unescape(target->smtp_password, sizeof(target->smtp_password), value);
+    else if (strcmp(field, "smtp_from") == 0)
+        config_unescape(target->smtp_from, sizeof(target->smtp_from), value);
+    else if (strcmp(field, "smtp_to") == 0)
+        config_unescape(target->smtp_to, sizeof(target->smtp_to), value);
+    else if (strcmp(field, "smtp_security") == 0)
+        safe_copy(target->smtp_security, sizeof(target->smtp_security),
+                  normalize_smtp_security(value));
+    else
+        return 0;
+    return 1;
+}
+
+static void migrate_legacy_targets(web_config_t *cfg) {
+    web_push_target_t *target;
+    int count = 0;
+
+    if (!cfg) return;
+    if (cfg->webhook[0]) {
+        target = &cfg->targets[count++];
+        init_push_target(target, count - 1);
+        target->enabled = 1;
+        safe_copy(target->name, sizeof(target->name), "Webhook");
+        safe_copy(target->webhook, sizeof(target->webhook), cfg->webhook);
+        safe_copy(target->platform, sizeof(target->platform), cfg->platform);
+        safe_copy(target->custom_ctype, sizeof(target->custom_ctype),
+                  cfg->custom_ctype);
+        safe_copy(target->custom_body, sizeof(target->custom_body),
+                  cfg->custom_body);
+    }
+    if ((cfg->smtp_host[0] || cfg->smtp_user[0] || cfg->smtp_password[0] ||
+         cfg->smtp_from[0] || cfg->smtp_to[0]) &&
+        count < ALICE_ENGINE_MAX_TARGETS) {
+        target = &cfg->targets[count++];
+        init_push_target(target, count - 1);
+        target->enabled = 1;
+        safe_copy(target->name, sizeof(target->name), "邮箱");
+        safe_copy(target->type, sizeof(target->type), TARGET_TYPE_EMAIL);
+        safe_copy(target->smtp_host, sizeof(target->smtp_host), cfg->smtp_host);
+        safe_copy(target->smtp_port, sizeof(target->smtp_port), cfg->smtp_port);
+        safe_copy(target->smtp_user, sizeof(target->smtp_user), cfg->smtp_user);
+        safe_copy(target->smtp_password, sizeof(target->smtp_password),
+                  cfg->smtp_password);
+        safe_copy(target->smtp_from, sizeof(target->smtp_from), cfg->smtp_from);
+        safe_copy(target->smtp_to, sizeof(target->smtp_to), cfg->smtp_to);
+        safe_copy(target->smtp_security, sizeof(target->smtp_security),
+                  cfg->smtp_security);
+    }
+    cfg->target_count = count;
 }
 
 static const char *normalize_target_mode(const char *mode) {
@@ -694,7 +983,8 @@ static int write_standalone_path_sh(int port) {
         "fi\n"
         "path_sh=/sbin\n"
         ". /sbin/global.sh\n"
-        "path_sh=/sbin\n",
+        "path_sh=/sbin\n"
+        "%s\n",
         PUSHER_AUTOSTART_BEGIN, PUSHER_PATH_SH_MARKER,
         PUSHER_RUN_PATH, PUSHER_BIN_PATH, port, PUSHER_START_LOG,
         port, PUSHER_START_LOG, PUSHER_START_LOG,
@@ -812,10 +1102,16 @@ static int install_persistent_autostart(const web_config_t *cfg) {
 static void load_web_config(web_config_t *cfg) {
     FILE *fp;
     char line[5000];
+    int saw_delivery = 0;
     int saw_platform = 0;
+    int saw_targets = 0;
+    int i;
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->port = DEFAULT_WEBUI_PORT;
+    for (i = 0; i < ALICE_ENGINE_MAX_TARGETS; i++)
+        init_push_target(&cfg->targets[i], i);
+    safe_copy(cfg->delivery, sizeof(cfg->delivery), DELIVERY_WEBHOOK);
     safe_copy(cfg->platform, sizeof(cfg->platform), "dingtalk");
     safe_copy(cfg->target_mode, sizeof(cfg->target_mode), "mifi");
     safe_copy(cfg->target_path, sizeof(cfg->target_path), TARGET_MIFI_PATH);
@@ -823,6 +1119,8 @@ static void load_web_config(web_config_t *cfg) {
               "application/json;charset=utf-8");
     safe_copy(cfg->custom_body, sizeof(cfg->custom_body),
               "{\"text\":\"{{json_text}}\"}");
+    safe_copy(cfg->smtp_port, sizeof(cfg->smtp_port), "587");
+    safe_copy(cfg->smtp_security, sizeof(cfg->smtp_security), "starttls");
     fp = fopen(DEFAULT_CONFIG_PATH, "r");
     if (!fp) return;
     while (fgets(line, sizeof(line), fp)) {
@@ -831,7 +1129,34 @@ static void load_web_config(web_config_t *cfg) {
         eq = strchr(line, '=');
         if (!eq) continue;
         *eq++ = 0;
-        if (strcmp(line, "webhook") == 0)
+        if (strcmp(line, "target_count") == 0) {
+            long count;
+            char *end;
+            errno = 0;
+            count = strtol(eq, &end, 10);
+            if (!errno && end != eq && count >= 0 &&
+                count <= ALICE_ENGINE_MAX_TARGETS)
+                cfg->target_count = (int)count;
+            saw_targets = 1;
+        } else {
+            int target_index;
+            const char *target_field;
+            if (target_key_parts(line, &target_index, &target_field)) {
+                if (load_target_field(&cfg->targets[target_index],
+                                      target_field, eq)) {
+                    if (cfg->target_count <= target_index)
+                        cfg->target_count = target_index + 1;
+                    saw_targets = 1;
+                }
+                continue;
+            }
+        }
+        if (strcmp(line, "delivery") == 0) {
+            safe_copy(cfg->delivery, sizeof(cfg->delivery),
+                      normalize_delivery(eq));
+            saw_delivery = 1;
+        }
+        else if (strcmp(line, "webhook") == 0)
             safe_copy(cfg->webhook, sizeof(cfg->webhook), eq);
         else if (strcmp(line, "platform") == 0)
         {
@@ -854,6 +1179,21 @@ static void load_web_config(web_config_t *cfg) {
             config_unescape(cfg->headtxt, sizeof(cfg->headtxt), eq);
         else if (strcmp(line, "tailtxt") == 0)
             config_unescape(cfg->tailtxt, sizeof(cfg->tailtxt), eq);
+        else if (strcmp(line, "smtp_host") == 0)
+            config_unescape(cfg->smtp_host, sizeof(cfg->smtp_host), eq);
+        else if (strcmp(line, "smtp_port") == 0)
+            config_unescape(cfg->smtp_port, sizeof(cfg->smtp_port), eq);
+        else if (strcmp(line, "smtp_user") == 0)
+            config_unescape(cfg->smtp_user, sizeof(cfg->smtp_user), eq);
+        else if (strcmp(line, "smtp_password") == 0)
+            config_unescape(cfg->smtp_password, sizeof(cfg->smtp_password), eq);
+        else if (strcmp(line, "smtp_from") == 0)
+            config_unescape(cfg->smtp_from, sizeof(cfg->smtp_from), eq);
+        else if (strcmp(line, "smtp_to") == 0)
+            config_unescape(cfg->smtp_to, sizeof(cfg->smtp_to), eq);
+        else if (strcmp(line, "smtp_security") == 0)
+            safe_copy(cfg->smtp_security, sizeof(cfg->smtp_security),
+                      normalize_smtp_security(eq));
         else if (strcmp(line, "port") == 0) {
             long port;
             char *end;
@@ -868,37 +1208,98 @@ static void load_web_config(web_config_t *cfg) {
         safe_copy(cfg->platform, sizeof(cfg->platform),
                   normalize_platform(detect_platform_from_url(cfg->webhook)));
     }
+    if (!saw_delivery) {
+        safe_copy(cfg->delivery, sizeof(cfg->delivery),
+                  cfg->webhook[0] ? DELIVERY_WEBHOOK :
+                  email_configured(cfg) ? DELIVERY_EMAIL : DELIVERY_WEBHOOK);
+    }
+    safe_copy(cfg->delivery, sizeof(cfg->delivery),
+              normalize_delivery(cfg->delivery));
     safe_copy(cfg->target_mode, sizeof(cfg->target_mode),
               normalize_target_mode(cfg->target_mode));
+    safe_copy(cfg->smtp_security, sizeof(cfg->smtp_security),
+              normalize_smtp_security(cfg->smtp_security));
+    if (!cfg->smtp_port[0])
+        safe_copy(cfg->smtp_port, sizeof(cfg->smtp_port), "587");
+    if (!saw_targets)
+        migrate_legacy_targets(cfg);
+    if (cfg->target_count < 0 || cfg->target_count > ALICE_ENGINE_MAX_TARGETS)
+        cfg->target_count = 0;
+    for (i = 0; i < cfg->target_count; i++) {
+        normalize_push_target(&cfg->targets[i], i);
+        clear_target_inactive_fields(&cfg->targets[i]);
+    }
     remove_newlines(cfg->target_path);
     if (!cfg->target_path[0] || strcmp(cfg->target_mode, "custom") != 0)
         safe_copy(cfg->target_path, sizeof(cfg->target_path),
                   target_default_path(cfg->target_mode));
 }
 
+static void write_target_config(FILE *fp, int index,
+                                const web_push_target_t *target) {
+    char esc_name[256];
+    char esc_webhook[2048];
+    char esc_ctype[512];
+    char esc_body[4096];
+    char esc_host[512];
+    char esc_port[64];
+    char esc_user[512];
+    char esc_password[512];
+    char esc_from[512];
+    char esc_to[512];
+
+    config_escape(esc_name, sizeof(esc_name), target->name);
+    config_escape(esc_webhook, sizeof(esc_webhook), target->webhook);
+    config_escape(esc_ctype, sizeof(esc_ctype), target->custom_ctype);
+    config_escape(esc_body, sizeof(esc_body), target->custom_body);
+    config_escape(esc_host, sizeof(esc_host), target->smtp_host);
+    config_escape(esc_port, sizeof(esc_port), target->smtp_port);
+    config_escape(esc_user, sizeof(esc_user), target->smtp_user);
+    config_escape(esc_password, sizeof(esc_password), target->smtp_password);
+    config_escape(esc_from, sizeof(esc_from), target->smtp_from);
+    config_escape(esc_to, sizeof(esc_to), target->smtp_to);
+    fprintf(fp, "target_%d_enabled=%d\n", index, target->enabled ? 1 : 0);
+    fprintf(fp, "target_%d_name=%s\n", index, esc_name);
+    fprintf(fp, "target_%d_type=%s\n", index, normalize_target_type(target->type));
+    fprintf(fp, "target_%d_platform=%s\n", index, normalize_platform(target->platform));
+    fprintf(fp, "target_%d_webhook=%s\n", index, esc_webhook);
+    fprintf(fp, "target_%d_custom_ctype=%s\n", index, esc_ctype);
+    fprintf(fp, "target_%d_custom_body=%s\n", index, esc_body);
+    fprintf(fp, "target_%d_smtp_host=%s\n", index, esc_host);
+    fprintf(fp, "target_%d_smtp_port=%s\n", index, esc_port);
+    fprintf(fp, "target_%d_smtp_user=%s\n", index, esc_user);
+    fprintf(fp, "target_%d_smtp_password=%s\n", index, esc_password);
+    fprintf(fp, "target_%d_smtp_from=%s\n", index, esc_from);
+    fprintf(fp, "target_%d_smtp_to=%s\n", index, esc_to);
+    fprintf(fp, "target_%d_smtp_security=%s\n", index,
+            normalize_smtp_security(target->smtp_security));
+}
+
 static int save_web_config(const web_config_t *cfg) {
     FILE *fp;
-    char esc_body[8192];
     char esc_head[1024];
     char esc_tail[1024];
+    int i;
+    int count;
 
     if (mkdir_parent_file(DEFAULT_CONFIG_PATH) < 0)
         return -1;
-    config_escape(esc_body, sizeof(esc_body), cfg->custom_body);
-    config_escape(esc_head, sizeof(esc_head), cfg->headtxt);
-    config_escape(esc_tail, sizeof(esc_tail), cfg->tailtxt);
     fp = fopen(DEFAULT_CONFIG_PATH, "w");
     if (!fp) return -1;
-    fprintf(fp, "webhook=%s\n", cfg->webhook);
-    fprintf(fp, "platform=%s\n", normalize_platform(cfg->platform));
+    config_escape(esc_head, sizeof(esc_head), cfg->headtxt);
+    config_escape(esc_tail, sizeof(esc_tail), cfg->tailtxt);
+    count = cfg->target_count;
+    if (count < 0) count = 0;
+    if (count > ALICE_ENGINE_MAX_TARGETS) count = ALICE_ENGINE_MAX_TARGETS;
+    fprintf(fp, "target_count=%d\n", count);
     fprintf(fp, "target_mode=%s\n", normalize_target_mode(cfg->target_mode));
     fprintf(fp, "target_path=%s\n", cfg->target_path);
-    fprintf(fp, "custom_ctype=%s\n", cfg->custom_ctype);
-    fprintf(fp, "custom_body=%s\n", esc_body);
     fprintf(fp, "num=%s\n", cfg->num);
     fprintf(fp, "headtxt=%s\n", esc_head);
     fprintf(fp, "tailtxt=%s\n", esc_tail);
     fprintf(fp, "port=%d\n", cfg->port > 0 ? cfg->port : DEFAULT_WEBUI_PORT);
+    for (i = 0; i < count; i++)
+        write_target_config(fp, i, &cfg->targets[i]);
     if (fclose(fp) != 0)
         return -1;
     chmod(DEFAULT_CONFIG_PATH, 0600);
@@ -1307,9 +1708,9 @@ static int start_service(const char *self_path, const web_config_t *cfg) {
     char target_path_for_log[256];
 
     (void)self_path;
-    if (!cfg->webhook[0]) {
+    if (!any_target_configured(cfg)) {
         errno = EINVAL;
-        ring_log_append("[WEBUI] service start failed: webhook is empty");
+        ring_log_append("[WEBUI] service start failed: no push target configured");
         return -1;
     }
     if (service_pid() > 0) {
@@ -1327,6 +1728,7 @@ static int start_service(const char *self_path, const web_config_t *cfg) {
     }
     if (pid == 0) {
         alice_engine_service_config_t engine_cfg;
+        alice_engine_push_target_t engine_targets[ALICE_ENGINE_MAX_TARGETS];
         char target_path[256];
         int rc;
 
@@ -1337,23 +1739,22 @@ static int start_service(const char *self_path, const web_config_t *cfg) {
         resolve_target_path(cfg, target_path, sizeof(target_path));
         alice_engine_set_log_callback(engine_ring_log_callback, NULL);
         ring_log_append("[WEBUI] service child started target=%s platform=%s",
-                        target_path, normalize_platform(cfg->platform));
+                        target_path, configured_platform_label(cfg));
         memset(&engine_cfg, 0, sizeof(engine_cfg));
-        engine_cfg.webhook = cfg->webhook;
-        engine_cfg.platform = normalize_platform(cfg->platform);
         engine_cfg.target_path = target_path;
-        engine_cfg.custom_ctype = cfg->custom_ctype;
-        engine_cfg.custom_body = cfg->custom_body;
         engine_cfg.num = cfg->num;
         engine_cfg.headtxt = cfg->headtxt;
         engine_cfg.tailtxt = cfg->tailtxt;
+        engine_cfg.targets = engine_targets;
+        engine_cfg.target_count = build_engine_target_list(
+            cfg, engine_targets, ALICE_ENGINE_MAX_TARGETS);
         rc = alice_engine_start_service(&engine_cfg);
         _exit(rc == 0 ? 0 : 1);
     }
     write_pid_file(DEFAULT_SERVICE_PID, pid);
     ring_log_append("[WEBUI] service started pid=%ld target=%s platform=%s",
                     (long)pid, target_path_for_log,
-                    normalize_platform(cfg->platform));
+                    configured_platform_label(cfg));
     return 0;
 }
 
@@ -1502,11 +1903,11 @@ static void append_page_start(char *body, size_t bodysz, const char *active,
         "main.page{max-width:1120px;width:100%%;margin:0 auto;padding:22px}.topline{display:flex;justify-content:space-between;gap:14px;margin-bottom:16px}.h1{font-size:25px;font-weight:800}.msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}"
         ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.panel{background:#fff;border:1px solid #d9e5dc;border-radius:8px;margin-bottom:14px;box-shadow:0 5px 16px rgba(24,37,29,.045);overflow:hidden;animation:rise .22s ease-out}.formtop{border-bottom:1px solid #e7eee8;padding:14px 16px}.title{font-size:16px;font-weight:800}.pad{padding:16px}.kv{border-bottom:1px solid #edf2ee;padding:8px 0}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:800;word-break:break-all;margin-top:3px}"
         "label{display:block;font-size:13px;font-weight:800;margin:11px 0 5px}input,textarea,select{width:100%%;border:1px solid #b8c7bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none}input,select{height:40px}textarea{min-height:84px;resize:vertical}input:focus,textarea:focus,select:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.fieldrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}.fieldrow button{margin:0}.hint.ok{color:#236a40}.hint.warn{color:#9a5a10}"
-        ".custombox{display:none;margin-top:10px;padding:12px;border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;animation:rise .18s ease-out}.custombox.show{display:block}"
+        ".custombox{display:none;margin-top:10px;padding:12px;border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;animation:rise .18s ease-out}.custombox.show{display:block}.targetlist{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:12px 0}.targetitem{border:1px solid #dbe8dc;border-radius:8px;background:#fbfdf9;padding:10px;text-align:left;cursor:pointer;min-height:76px}.targetitem.active{border-color:#2f7d4f;background:#e8f4eb}.targetitem .targetname{font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.targetitem .targetmeta{font-size:11px;color:#68786d;margin-top:5px;line-height:1.4}.targetpanel{display:none;border-top:1px solid #e7eee8;padding-top:8px}.targetpanel.show{display:block}.targetgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 12px}.targetwide{grid-column:1/-1}.targetbar{display:flex;align-items:center;justify-content:space-between;gap:8px}.targetbar button{height:34px;padding:0 12px;font-size:12px}.targetstatus{font-size:12px;color:#68786d}.targetstatus.ok{color:#236a40}.targetstatus.warn{color:#9a5a10}"
         ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer}button.alt{background:#fff;color:#2f7d4f}pre,.preview{white-space:pre-wrap;word-break:break-word;background:#101811;color:#d9f5df;border-radius:8px;padding:12px;max-height:520px;overflow:auto}.preview{margin-top:8px;min-height:116px;color:#e3f8e7}"
         ".templates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.tpl{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:12px}.tplname{font-size:14px;font-weight:800}.tpltext{font-size:12px;color:#56695e;line-height:1.6;margin-top:5px;word-break:break-all}.tplcode{font-family:monospace;background:#eef6ef;border-radius:6px;padding:5px 6px;color:#234732}"
         ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.labelrow{margin-top:13px;color:#5f7166;font-size:13px;font-weight:800}.labelrow .repo{margin-top:0}.supporthead{display:block}.supportdesc{color:#405246;font-size:14px;font-weight:700;line-height:1.75;margin-top:7px}.supportgrid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px;align-items:stretch}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.plainlink{display:inline-block;color:#1f6d42;font-weight:800;word-break:break-all}.qrbox{display:flex;justify-content:center;align-items:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
-        "@media(max-width:820px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc}.nav{flex-direction:row;overflow:auto}.sidecard{display:none}main.page{padding:16px}.grid,.about,.supportgrid,.templates{grid-template-columns:1fr}.topline{display:block}.qr{max-width:220px}}"
+        "@media(max-width:820px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc}.nav{flex-direction:row;overflow:auto}.sidecard{display:none}main.page{padding:16px}.grid,.about,.supportgrid,.templates,.targetgrid{grid-template-columns:1fr}.targetlist{grid-template-columns:repeat(2,minmax(0,1fr))}.topline{display:block}.qr{max-width:220px}}"
         "</style></head><body><div class=\"shell\"><aside class=\"side\">"
         "<div><div class=\"brand\">Alice Pusher</div><div class=\"sub\">短信推送控制台</div></div>"
         "<nav class=\"nav\"><a class=\"%s\" href=\"/\">控制台</a><a class=\"%s\" href=\"/config\">配置</a><a class=\"%s\" href=\"/logs\">运行日志</a><a class=\"%s\" href=\"/about\">关于</a></nav>"
@@ -1525,8 +1926,18 @@ static void append_page_start(char *body, size_t bodysz, const char *active,
 static void append_page_end(char *body, size_t bodysz) {
     buf_append(body, bodysz,
         "</main></div><script>"
-        "function toggleCustom(){var s=document.getElementById('platformSelect'),b=document.getElementById('customFields');if(!s||!b)return;b.className=s.value==='custom'?'custombox show':'custombox';}"
-        "function toggleTarget(){var s=document.getElementById('targetModeSelect'),b=document.getElementById('targetCustomFields');if(!s||!b)return;b.className=s.value==='custom'?'custombox show':'custombox';}"
+        "function targetValue(i,n){var e=document.getElementById('target_'+i+'_'+n);return e?e.value:'';}"
+        "function targetCount(){var e=document.getElementById('targetCount');return e?parseInt(e.value||'0',10):0;}"
+        "function targetIndex(){var e=document.getElementById('targetIndex');return e?parseInt(e.value||'0',10):0;}"
+        "function targetHasData(i){var n=targetValue(i,'name'),d='目标 '+(i+1);return targetValue(i,'webhook')||targetValue(i,'smtp_host')||targetValue(i,'smtp_from')||targetValue(i,'smtp_to')||(n&&n!==d); }"
+        "function targetConfigured(i){return targetValue(i,'type')==='email'?(targetValue(i,'smtp_host')&&targetValue(i,'smtp_from')&&targetValue(i,'smtp_to')):!!targetValue(i,'webhook');}"
+        "function targetTypeLabel(t){return t==='email'?'邮箱':'Webhook';}"
+        "function updateTargetItems(){var c=targetCount(),i;for(i=0;i<4;i++){var item=document.getElementById('targetItem'+i),name=targetValue(i,'name')||('目标 '+(i+1)),type=targetTypeLabel(targetValue(i,'type')),enabled=targetValue(i,'enabled')==='1';if(item){item.className='targetitem'+(i===targetIndex()?' active':'');item.querySelector('.targetname').textContent=name;item.querySelector('.targetmeta').textContent=(enabled?'启用':'停用')+' · '+type+(targetConfigured(i)?' · 配置完整':' · 待配置');}}var s=document.getElementById('targetSummary');if(s)s.textContent='已启用 '+Array.from({length:c},function(_,j){return targetValue(j,'enabled')==='1'&&targetConfigured(j)?1:0;}).reduce(function(a,b){return a+b;},0)+' / '+c+' 个目标';var add=document.getElementById('addTargetButton');if(add)add.disabled=c>=4;}"
+        "function selectTarget(i){var c=targetCount();if(i>=c)return;var e=document.getElementById('targetIndex');if(e)e.value=i;for(var j=0;j<4;j++){var p=document.getElementById('targetPanel'+j);if(p)p.className='targetpanel'+(j===i?' show':'');}toggleTargetType(i);updateTargetItems();updatePreview();}"
+        "function toggleTargetType(i){var email=targetValue(i,'type')==='email',w=document.getElementById('target_'+i+'_webhook_fields'),e=document.getElementById('target_'+i+'_email_fields'),c=document.getElementById('target_'+i+'_custom_fields'),p=targetValue(i,'platform');if(w)w.className=email?'custombox':'custombox show';if(e)e.className=email?'custombox show':'custombox';if(c)c.className=!email&&p==='custom'?'custombox show':'custombox';}"
+        "function addTarget(){var c=targetCount();if(c>=4)return;var e=document.getElementById('targetCount');if(e)e.value=c+1;var n=document.getElementById('target_'+c+'_name'),en=document.getElementById('target_'+c+'_enabled');if(n&&!n.value)n.value='目标 '+(c+1);if(en)en.value='1';selectTarget(c);}"
+        "function removeTarget(){var i=targetIndex(),c=targetCount(),fields=['name','webhook','custom_ctype','custom_body','smtp_host','smtp_port','smtp_user','smtp_password','smtp_from','smtp_to'];fields.forEach(function(n){var e=document.getElementById('target_'+i+'_'+n);if(e)e.value='';});var en=document.getElementById('target_'+i+'_enabled');if(en)en.value='0';if(i===c-1){while(c>0&&!targetHasData(c-1))c--;var count=document.getElementById('targetCount');if(count)count.value=c;}if(c>0)selectTarget(Math.min(i,c-1));else{updateTargetItems();updatePreview();} }"
+        "function toggleTargetProcess(){var s=document.getElementById('targetModeSelect'),b=document.getElementById('targetCustomFields');if(!s||!b)return;b.className=s.value==='custom'?'custombox show':'custombox';}"
         "function fetchMsisdn(b){var i=document.getElementById('numInput'),m=document.getElementById('numMsg');"
         "if(m){m.textContent='正在读取 nv show...';m.className='hint';}"
         "if(b){b.disabled=true;b.textContent='获取中';}"
@@ -1539,8 +1950,8 @@ static void append_page_end(char *body, size_t bodysz) {
         "function jesc(s){return JSON.stringify(s||'').slice(1,-1);}"
         "function barkKey(u){var s=(u||''),i=s.indexOf('://');if(i>=0)s=s.slice(i+3);i=s.indexOf('/');if(i<0)return '';s=s.slice(i+1);if(!s||s.indexOf('push')===0)return '';return s.split(/[/?#]/)[0];}"
         "function sampleText(){var n=document.getElementById('numInput'),num=n&&n.value?n.value:'N/A';return '接收短信设备手机号:'+num+'\\n[pdu解码后的信息]\\n短消息服务中心:+8613800755500\\n发件人:10086\\n时间戳:26/06/30 12:00:00\\n短信内容:Alice Pusher Bot 示例短信';}"
-        "function updatePreview(){var h=document.getElementById('headInput'),t=document.getElementById('tailInput'),p=document.getElementById('msgPreview'),s=document.getElementById('platformSelect'),w=document.getElementById('webhookInput'),ct=document.getElementById('ctypeInput'),cb=document.getElementById('customBodyInput');if(!p)return;var a=[],text,plat=s?s.value:'dingtalk',ctype='application/json;charset=utf-8',payload='',jt,key,tmpl;if(h&&h.value)a.push(h.value);a.push(sampleText());if(t&&t.value)a.push(t.value);text=a.join('\\n');if(plat==='serverchan'){ctype='application/x-www-form-urlencoded';payload='title=Alice%%20Pusher&desp='+enc(text);}else if(plat==='telegram'){ctype='application/x-www-form-urlencoded';payload='text='+enc(text);}else if(plat==='custom'){ctype=(ct&&ct.value)||'application/json;charset=utf-8';tmpl=(cb&&cb.value)||'{\"text\":\"{{json_text}}\"}';payload=tmpl.split('{{json_text}}').join(jesc(text)).split('{{url_text}}').join(enc(text)).split('{{text}}').join(text);}else{jt=jesc(text);if(plat==='feishu')payload='{\"msg_type\":\"text\",\"content\":{\"text\":\"'+jt+'\"}}';else if(plat==='discord')payload='{\"content\":\"'+jt+'\"}';else if(plat==='bark'){key=barkKey(w&&w.value);payload=key?'{\"title\":\"Alice Pusher\",\"body\":\"'+jt+'\",\"device_key\":\"'+jesc(key)+'\"}':'需要填写 Bark URL 以提取 device_key';}else payload='{\"msgtype\":\"text\",\"text\":{\"content\":\"'+jt+'\"}}';}p.textContent='最终文本:\\n'+text+'\\n\\nContent-Type:\\n'+ctype+'\\n\\nPayload:\\n'+payload;}"
-        "toggleCustom();toggleTarget();updatePreview();"
+        "function updatePreview(){var h=document.getElementById('headInput'),t=document.getElementById('tailInput'),p=document.getElementById('msgPreview'),i=targetIndex();if(!p)return;var a=[],text,plat=targetValue(i,'platform'),type=targetValue(i,'type'),ctype='application/json;charset=utf-8',payload='',jt,key,tmpl;if(h&&h.value)a.push(h.value);a.push(sampleText());if(t&&t.value)a.push(t.value);text=a.join('\\n');if(type==='email'){p.textContent='目标: '+(targetValue(i,'name')||('目标 '+(i+1)))+'\\n\\n最终文本:\\n'+text+'\\n\\n邮箱服务器:\\n'+(targetValue(i,'smtp_host')||'未配置')+':'+(targetValue(i,'smtp_port')||'587')+'\\n安全模式:\\n'+(targetValue(i,'smtp_security')||'starttls')+'\\n发件人:\\n'+(targetValue(i,'smtp_from')||'未配置')+'\\n收件人:\\n'+(targetValue(i,'smtp_to')||'未配置');return;}var w=targetValue(i,'webhook'),ct=targetValue(i,'custom_ctype'),cb=targetValue(i,'custom_body');if(!w){p.textContent='目标: '+(targetValue(i,'name')||('目标 '+(i+1)))+'\\n\\n最终文本:\\n'+text+'\\n\\n推送方式:\\nWebhook\\n\\n请填写 Webhook URL';return;}if(plat==='serverchan'){ctype='application/x-www-form-urlencoded';payload='title=Alice%%20Pusher&desp='+enc(text);}else if(plat==='telegram'){ctype='application/x-www-form-urlencoded';payload='text='+enc(text);}else if(plat==='custom'){ctype=ct||'application/json;charset=utf-8';tmpl=cb||'{\"text\":\"{{json_text}}\"}';payload=tmpl.split('{{json_text}}').join(jesc(text)).split('{{url_text}}').join(enc(text)).split('{{text}}').join(text);}else{jt=jesc(text);if(plat==='feishu')payload='{\"msg_type\":\"text\",\"content\":{\"text\":\"'+jt+'\"}}';else if(plat==='discord')payload='{\"content\":\"'+jt+'\"}';else if(plat==='bark'){key=barkKey(w);payload=key?'{\"title\":\"Alice Pusher\",\"body\":\"'+jt+'\",\"device_key\":\"'+jesc(key)+'\"}':'需要填写 Bark URL 以提取 device_key';}else payload='{\"msgtype\":\"text\",\"text\":{\"content\":\"'+jt+'\"}}';}p.textContent='目标: '+(targetValue(i,'name')||('目标 '+(i+1)))+'\\n\\n最终文本:\\n'+text+'\\n\\nContent-Type:\\n'+ctype+'\\n\\nPayload:\\n'+payload;}"
+        "toggleTargetProcess();if(targetCount()>0)selectTarget(Math.min(targetIndex(),targetCount()-1));else{updateTargetItems();updatePreview();}"
         "</script></body></html>");
 }
 
@@ -1551,10 +1962,11 @@ static void render_home(int fd, const char *message) {
     pid_t spid, strpid;
     int target_pid;
     char target_path[256];
-    char esc_num[256], esc_hook[256], esc_platform[128];
+    char esc_num[256], esc_delivery[128], esc_platform[128];
     char esc_target_label[128], esc_target_path[512];
     char esc_auto_mode[128], esc_auto_payload[512], esc_auto_script[512];
     char esc_auto_error[512];
+    char delivery_summary[128];
     const char *auto_label;
     const char *auto_detail;
     const char *auto_payload;
@@ -1571,8 +1983,10 @@ static void render_home(int fd, const char *message) {
     resolve_target_path(&cfg, target_path, sizeof(target_path));
     target_pid = alice_engine_find_process_by_exe_path(target_path);
     html_escape(esc_num, sizeof(esc_num), cfg.num[0] ? cfg.num : "-");
-    html_escape(esc_hook, sizeof(esc_hook), cfg.webhook[0] ? "已配置" : "未配置");
     html_escape(esc_platform, sizeof(esc_platform), configured_platform_label(&cfg));
+    snprintf(delivery_summary, sizeof(delivery_summary), "%d / %d 个目标",
+             enabled_target_count(&cfg), cfg.target_count);
+    html_escape(esc_delivery, sizeof(esc_delivery), delivery_summary);
     html_escape(esc_target_label, sizeof(esc_target_label),
                 target_mode_label(cfg.target_mode));
     html_escape(esc_target_path, sizeof(esc_target_path), target_path);
@@ -1610,7 +2024,7 @@ static void render_home(int fd, const char *message) {
         "<div class=\"kv\"><div class=\"k\">进程路径</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">目标 PID</div><div class=\"v\">%d</div></div>"
         "<div class=\"kv\"><div class=\"k\">推送平台</div><div class=\"v\">%s</div></div>"
-        "<div class=\"kv\"><div class=\"k\">Webhook</div><div class=\"v\">%s</div></div>"
+        "<div class=\"kv\"><div class=\"k\">启用目标</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">设备手机号</div><div class=\"v\">%s</div></div>"
         "</div><div class=\"actions\">"
         "<form method=\"post\" action=\"/start\"><button type=\"submit\">启动服务</button></form>"
@@ -1635,7 +2049,7 @@ static void render_home(int fd, const char *message) {
         "</div><div class=\"hint\">当前入口只使用 userdata；不会修改 rootfs 或 /etc/rc。</div></div></section>",
         spid > 0 ? "运行中" : "未运行", (long)spid, (long)strpid,
         esc_target_label, esc_target_path, target_pid > 0 ? target_pid : 0,
-        esc_platform, esc_hook, esc_num,
+        esc_platform, esc_delivery, esc_num,
         auto_label, auto_detail, esc_auto_mode,
         ast.wonder_detected ? "已部署" : "未部署",
         esc_auto_payload, esc_auto_script,
@@ -1648,11 +2062,14 @@ static void render_home(int fd, const char *message) {
     free(body);
 }
 
-static void render_config(int fd, const char *message) {
+#if 0
+static void render_config_legacy(int fd, const char *message) {
     web_config_t cfg;
     char *body = calloc(1, WEB_BODY_MAX);
     char *custom_body = calloc(1, 12288);
     char webhook[2048], num[256], head[1024], tail[1024];
+    char smtp_host[512], smtp_port[64], smtp_user[512];
+    char smtp_password[512], smtp_from[512], smtp_to[512];
     char target_path[512];
     char sample_body[1024], sample_final[2048], sample_payload[4096];
     char sample_ctype[160], sample_preview[8192], sample_preview_esc[20000];
@@ -1673,18 +2090,34 @@ static void render_config(int fd, const char *message) {
     html_escape(target_path, sizeof(target_path), cfg.target_path);
     html_escape(custom_ctype, sizeof(custom_ctype), cfg.custom_ctype);
     html_escape(custom_body, 12288, cfg.custom_body);
+    html_escape(smtp_host, sizeof(smtp_host), cfg.smtp_host);
+    html_escape(smtp_port, sizeof(smtp_port), cfg.smtp_port);
+    html_escape(smtp_user, sizeof(smtp_user), cfg.smtp_user);
+    html_escape(smtp_password, sizeof(smtp_password), cfg.smtp_password);
+    html_escape(smtp_from, sizeof(smtp_from), cfg.smtp_from);
+    html_escape(smtp_to, sizeof(smtp_to), cfg.smtp_to);
     snprintf(sample_body, sizeof(sample_body),
              "接收短信设备手机号:%s\n[pdu解码后的信息]\n短消息服务中心:+8613800755500\n发件人:10086\n时间戳:26/06/30 12:00:00\n短信内容:Alice Pusher Bot 示例短信",
              cfg.num[0] ? cfg.num : "N/A");
     alice_engine_build_push_message(sample_final, sizeof(sample_final),
                        cfg.headtxt, sample_body, cfg.tailtxt);
-    if (alice_engine_build_webhook_payload(cfg.webhook, cfg.platform, sample_final,
-                              cfg.custom_ctype, cfg.custom_body,
-                              sample_payload, sizeof(sample_payload),
-                              sample_ctype, sizeof(sample_ctype)) < 0) {
+    if (!delivery_is_email(&cfg) && cfg.webhook[0] &&
+        alice_engine_build_webhook_payload(cfg.webhook, cfg.platform, sample_final,
+                                  cfg.custom_ctype, cfg.custom_body,
+                                  sample_payload, sizeof(sample_payload),
+                                  sample_ctype, sizeof(sample_ctype)) == 0) {
+        /* Keep the webhook preview when a webhook is configured. */
+    } else if (delivery_is_email(&cfg) && email_configured(&cfg)) {
+        safe_copy(sample_ctype, sizeof(sample_ctype), "SMTP message/rfc822");
+        snprintf(sample_payload, sizeof(sample_payload),
+                 "服务器: %s:%s\n安全模式: %s\n发件人: %s\n收件人: %s\n\n%s",
+                 cfg.smtp_host, cfg.smtp_port,
+                 normalize_smtp_security(cfg.smtp_security),
+                 cfg.smtp_from, cfg.smtp_to, sample_final);
+    } else {
         safe_copy(sample_ctype, sizeof(sample_ctype), "-");
         safe_copy(sample_payload, sizeof(sample_payload),
-                  "无法生成 Payload：请检查平台、Webhook 或自定义模板。");
+                  "请选择 Webhook 或邮箱，并完成对应配置。");
     }
     snprintf(sample_preview, sizeof(sample_preview),
              "最终文本:\n%s\n\nContent-Type:\n%s\n\nPayload:\n%s",
@@ -1692,7 +2125,7 @@ static void render_config(int fd, const char *message) {
     html_escape(sample_preview_esc, sizeof(sample_preview_esc), sample_preview);
     port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
     append_page_start(body, WEB_BODY_MAX, "config", "配置",
-                      "保存 webhook、手机号、推送文本和平台", message);
+                      "选择 Webhook 或邮箱作为短信推送方式", message);
     buf_append(body, WEB_BODY_MAX,
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">WebUI 设置</div></div><div class=\"pad\">"
         "<form method=\"post\" action=\"/set_port\">"
@@ -1711,7 +2144,12 @@ static void render_config(int fd, const char *message) {
         "<label>自定义进程路径</label><input name=\"target_path\" value=\"%s\" placeholder=\"/sbin/zte_mifi\">"
         "<div class=\"hint\">填写 /proc/&lt;pid&gt;/exe 指向的可执行文件路径。保存后重启服务生效。</div>"
         "</div>"
-        "<label>推送平台</label><select id=\"platformSelect\" name=\"platform\" onchange=\"toggleCustom();updatePreview()\">"
+        "<label>推送方式</label><select id=\"deliverySelect\" name=\"delivery\" onchange=\"toggleDelivery();updatePreview()\">"
+        "<option value=\"webhook\"%s>Webhook</option>"
+        "<option value=\"email\"%s>邮箱</option>"
+        "</select>"
+        "<div id=\"webhookFields\" class=\"custombox%s\">"
+        "<label>Webhook 平台</label><select id=\"platformSelect\" name=\"platform\" onchange=\"toggleCustom();updatePreview()\">"
         "<option value=\"dingtalk\"%s>钉钉</option>"
         "<option value=\"feishu\"%s>飞书</option>"
         "<option value=\"wecom\"%s>企业微信</option>"
@@ -1721,16 +2159,31 @@ static void render_config(int fd, const char *message) {
         "<option value=\"bark\"%s>Bark</option>"
         "<option value=\"custom\"%s>自定义</option>"
         "</select>"
-        "<label>Webhook URL</label><textarea id=\"webhookInput\" name=\"webhook\" required oninput=\"updatePreview()\">%s</textarea>"
+        "<label>Webhook URL</label><textarea id=\"webhookInput\" name=\"webhook\" oninput=\"updatePreview()\">%s</textarea>"
         "<div id=\"customFields\" class=\"custombox\">"
         "<label>自定义 Content-Type</label><input id=\"ctypeInput\" name=\"custom_ctype\" value=\"%s\" oninput=\"updatePreview()\">"
         "<label>自定义消息体模板</label><textarea id=\"customBodyInput\" name=\"custom_body\" rows=\"8\" oninput=\"updatePreview()\">%s</textarea>"
         "<div class=\"hint\">占位符：{{json_text}} 适合 JSON 字符串，{{url_text}} 适合表单或 URL 编码，{{text}} 为原文。</div>"
         "</div>"
+        "</div>"
+        "<div id=\"emailFields\" class=\"custombox%s\">"
+        "<label>SMTP 服务器</label><input name=\"smtp_host\" value=\"%s\" placeholder=\"smtp.example.com\" oninput=\"updatePreview()\">"
+        "<label>SMTP 端口</label><input name=\"smtp_port\" value=\"%s\" inputmode=\"numeric\" pattern=\"[0-9]*\" oninput=\"updatePreview()\">"
+        "<label>连接安全</label><select name=\"smtp_security\" onchange=\"updatePreview()\">"
+        "<option value=\"starttls\"%s>STARTTLS（推荐）</option>"
+        "<option value=\"tls\"%s>隐式 TLS</option>"
+        "<option value=\"plain\"%s>明文</option>"
+        "</select>"
+        "<label>SMTP 用户名（可选）</label><input name=\"smtp_user\" value=\"%s\" autocomplete=\"username\">"
+        "<label>SMTP 密码（可选）</label><input type=\"password\" name=\"smtp_password\" value=\"%s\" autocomplete=\"current-password\">"
+        "<label>发件人地址</label><input name=\"smtp_from\" value=\"%s\" placeholder=\"sender@example.com\" oninput=\"updatePreview()\">"
+        "<label>收件人地址</label><input name=\"smtp_to\" value=\"%s\" placeholder=\"receiver@example.com\" oninput=\"updatePreview()\">"
+        "<div class=\"hint\">Webhook 与邮箱为二选一的推送方式。邮箱需要完整填写 SMTP 服务器、发件人和收件人；证书校验关闭，建议使用 STARTTLS 或隐式 TLS。</div>"
+        "</div>"
         "<label>设备手机号，可留空自动读取 nv show</label><div class=\"fieldrow\"><input id=\"numInput\" name=\"num\" value=\"%s\" oninput=\"updatePreview()\"><button class=\"alt\" type=\"button\" onclick=\"fetchMsisdn(this)\">获取</button></div><div id=\"numMsg\" class=\"hint\">获取不到时可手动填写，也可以留空。</div>"
         "<label>消息前缀</label><textarea id=\"headInput\" name=\"headtxt\" rows=\"3\" oninput=\"updatePreview()\">%s</textarea>"
         "<label>消息后缀</label><textarea id=\"tailInput\" name=\"tailtxt\" rows=\"3\" oninput=\"updatePreview()\">%s</textarea>"
-        "<label>发送内容示例（按当前平台编码）</label><div id=\"msgPreview\" class=\"preview\">%s</div>"
+        "<label>发送内容示例（按当前推送方式）</label><div id=\"msgPreview\" class=\"preview\">%s</div>"
         "<div class=\"actions\"><button type=\"submit\">保存配置</button></div>"
         "</form><div class=\"hint\">配置保存到 " DEFAULT_CONFIG_PATH "，权限 0600。</div></div></section>"
         "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">Webhook 模板</div></div><div class=\"pad templates\">"
@@ -1748,6 +2201,8 @@ static void render_config(int fd, const char *message) {
         target_selected_attr(cfg.target_mode, "ufi"),
         target_selected_attr(cfg.target_mode, "custom"),
         target_path,
+        selected_attr(cfg.delivery, DELIVERY_WEBHOOK),
+        selected_attr(cfg.delivery, DELIVERY_EMAIL),
         selected_attr(cfg.platform, "dingtalk"),
         selected_attr(cfg.platform, "feishu"),
         selected_attr(cfg.platform, "wecom"),
@@ -1756,11 +2211,147 @@ static void render_config(int fd, const char *message) {
         selected_attr(cfg.platform, "telegram"),
         selected_attr(cfg.platform, "bark"),
         selected_attr(cfg.platform, "custom"),
-        webhook, custom_ctype, custom_body, num,
+        delivery_is_email(&cfg) ? "" : " show",
+        webhook, custom_ctype, custom_body,
+        delivery_is_email(&cfg) ? " show" : "",
+        smtp_host, smtp_port,
+        strcmp(normalize_smtp_security(cfg.smtp_security), "starttls") == 0 ? " selected" : "",
+        strcmp(normalize_smtp_security(cfg.smtp_security), "tls") == 0 ? " selected" : "",
+        strcmp(normalize_smtp_security(cfg.smtp_security), "plain") == 0 ? " selected" : "",
+        smtp_user, smtp_password, smtp_from, smtp_to,
+        num,
         head, tail, sample_preview_esc);
     append_page_end(body, WEB_BODY_MAX);
     http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
     free(custom_body);
+    free(body);
+}
+#endif
+
+static void append_target_panel(char *body, size_t bodysz,
+                                const web_push_target_t *target, int index,
+                                int active) {
+    char name[256], webhook[2048], ctype[256], custom_body[4096];
+    char smtp_host[512], smtp_port[64], smtp_user[512], smtp_password[512];
+    char smtp_from[512], smtp_to[512];
+    const char *type = normalize_target_type(target->type);
+    const char *type_webhook = strcmp(type, TARGET_TYPE_WEBHOOK) == 0 ? " selected" : "";
+    const char *type_email = target_is_email(target) ? " selected" : "";
+    const char *enabled = target->enabled ? " selected" : "";
+    const char *disabled = target->enabled ? "" : " selected";
+    const char *webhook_class = target_is_email(target) ? "" : " show";
+    const char *email_class = target_is_email(target) ? " show" : "";
+    const char *custom_class = !target_is_email(target) &&
+        strcmp(normalize_platform(target->platform), "custom") == 0 ? " show" : "";
+
+    html_escape(name, sizeof(name), target->name);
+    html_escape(webhook, sizeof(webhook), target->webhook);
+    html_escape(ctype, sizeof(ctype), target->custom_ctype);
+    html_escape(custom_body, sizeof(custom_body), target->custom_body);
+    html_escape(smtp_host, sizeof(smtp_host), target->smtp_host);
+    html_escape(smtp_port, sizeof(smtp_port), target->smtp_port);
+    html_escape(smtp_user, sizeof(smtp_user), target->smtp_user);
+    html_escape(smtp_password, sizeof(smtp_password), target->smtp_password);
+    html_escape(smtp_from, sizeof(smtp_from), target->smtp_from);
+    html_escape(smtp_to, sizeof(smtp_to), target->smtp_to);
+    buf_append(body, bodysz,
+        "<div id=\"targetPanel%d\" class=\"targetpanel%s\"><div class=\"targetgrid\">"
+        "<div><label>启用状态</label><select id=\"target_%d_enabled\" name=\"target_%d_enabled\" onchange=\"updateTargetItems();updatePreview()\"><option value=\"1\"%s>启用</option><option value=\"0\"%s>停用</option></select></div>"
+        "<div><label>目标名称</label><input id=\"target_%d_name\" name=\"target_%d_name\" value=\"%s\" oninput=\"updateTargetItems();updatePreview()\"></div>"
+        "<div class=\"targetwide\"><label>目标类型</label><select id=\"target_%d_type\" name=\"target_%d_type\" onchange=\"toggleTargetType(%d);updateTargetItems();updatePreview()\"><option value=\"webhook\"%s>Webhook</option><option value=\"email\"%s>邮箱</option></select></div>"
+        "<div id=\"target_%d_webhook_fields\" class=\"custombox%s targetwide\">"
+        "<label>Webhook 平台</label><select id=\"target_%d_platform\" name=\"target_%d_platform\" onchange=\"toggleTargetType(%d);updatePreview()\">"
+        "<option value=\"dingtalk\"%s>钉钉</option><option value=\"feishu\"%s>飞书</option><option value=\"wecom\"%s>企业微信</option><option value=\"serverchan\"%s>Server 酱</option><option value=\"discord\"%s>Discord</option><option value=\"telegram\"%s>Telegram Bot</option><option value=\"bark\"%s>Bark</option><option value=\"custom\"%s>自定义</option></select>"
+        "<label>Webhook URL</label><textarea id=\"target_%d_webhook\" name=\"target_%d_webhook\" oninput=\"updateTargetItems();updatePreview()\">%s</textarea>"
+        "<div id=\"target_%d_custom_fields\" class=\"custombox%s\">"
+        "<label>自定义 Content-Type</label><input id=\"target_%d_custom_ctype\" name=\"target_%d_custom_ctype\" value=\"%s\" oninput=\"updatePreview()\">"
+        "<label>自定义消息体模板</label><textarea id=\"target_%d_custom_body\" name=\"target_%d_custom_body\" rows=\"6\" oninput=\"updatePreview()\">%s</textarea>"
+        "<div class=\"hint\">支持 {{json_text}}、{{url_text}} 和 {{text}} 占位符。</div></div></div>"
+        "<div id=\"target_%d_email_fields\" class=\"custombox%s targetwide\">"
+        "<label>SMTP 服务器</label><input id=\"target_%d_smtp_host\" name=\"target_%d_smtp_host\" value=\"%s\" placeholder=\"smtp.example.com\" oninput=\"updateTargetItems();updatePreview()\">"
+        "<label>SMTP 端口</label><input id=\"target_%d_smtp_port\" name=\"target_%d_smtp_port\" value=\"%s\" inputmode=\"numeric\" pattern=\"[0-9]*\" oninput=\"updatePreview()\">"
+        "<label>连接安全</label><select id=\"target_%d_smtp_security\" name=\"target_%d_smtp_security\" onchange=\"updatePreview()\"><option value=\"starttls\"%s>STARTTLS（推荐）</option><option value=\"tls\"%s>隐式 TLS</option><option value=\"plain\"%s>明文</option></select>"
+        "<label>SMTP 用户名（可选）</label><input id=\"target_%d_smtp_user\" name=\"target_%d_smtp_user\" value=\"%s\" autocomplete=\"username\">"
+        "<label>SMTP 密码（可选）</label><input type=\"password\" id=\"target_%d_smtp_password\" name=\"target_%d_smtp_password\" value=\"%s\" autocomplete=\"current-password\">"
+        "<label>发件人地址</label><input id=\"target_%d_smtp_from\" name=\"target_%d_smtp_from\" value=\"%s\" placeholder=\"sender@example.com\" oninput=\"updateTargetItems();updatePreview()\">"
+        "<label>收件人地址</label><input id=\"target_%d_smtp_to\" name=\"target_%d_smtp_to\" value=\"%s\" placeholder=\"receiver@example.com\" oninput=\"updateTargetItems();updatePreview()\">"
+        "<div class=\"hint\">此邮箱目标独立于其他目标，证书校验关闭。</div></div></div></div>",
+        index, active ? " show" : "", index, index, enabled, disabled,
+        index, index, name, index, index, index, type_webhook, type_email,
+        index, webhook_class, index, index, index,
+        selected_attr(target->platform, "dingtalk"), selected_attr(target->platform, "feishu"),
+        selected_attr(target->platform, "wecom"), selected_attr(target->platform, "serverchan"),
+        selected_attr(target->platform, "discord"), selected_attr(target->platform, "telegram"),
+        selected_attr(target->platform, "bark"), selected_attr(target->platform, "custom"),
+        index, index, webhook, index, custom_class, index, index, ctype,
+        index, index, custom_body, index, email_class, index, index, smtp_host,
+        index, index, smtp_port, index, index,
+        strcmp(normalize_smtp_security(target->smtp_security), "starttls") == 0 ? " selected" : "",
+        strcmp(normalize_smtp_security(target->smtp_security), "tls") == 0 ? " selected" : "",
+        strcmp(normalize_smtp_security(target->smtp_security), "plain") == 0 ? " selected" : "",
+        index, index, smtp_user, index, index, smtp_password,
+        index, index, smtp_from, index, index, smtp_to);
+}
+
+static void render_config(int fd, const char *message) {
+    web_config_t cfg;
+    char *body = calloc(1, WEB_BODY_MAX);
+    char num[256], head[1024], tail[1024], target_path[512];
+    int i;
+    int active;
+    int port;
+
+    if (!body) {
+        http_send(fd, 500, "Internal Server Error", "text/plain", "out of memory\n");
+        return;
+    }
+    load_web_config(&cfg);
+    html_escape(num, sizeof(num), cfg.num);
+    html_escape(head, sizeof(head), cfg.headtxt);
+    html_escape(tail, sizeof(tail), cfg.tailtxt);
+    html_escape(target_path, sizeof(target_path), cfg.target_path);
+    active = cfg.target_count > 0 ? 0 : -1;
+    port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
+    append_page_start(body, WEB_BODY_MAX, "config", "配置",
+                      "管理多个 Webhook 和邮箱推送目标", message);
+    buf_append(body, WEB_BODY_MAX,
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">WebUI 设置</div></div><div class=\"pad\">"
+        "<form method=\"post\" action=\"/set_port\"><label>WebUI 端口</label><input name=\"port\" value=\"%d\" inputmode=\"numeric\" pattern=\"[0-9]*\" required><div class=\"actions\"><button type=\"submit\">保存并切换端口</button></div></form>"
+        "<div class=\"hint\">端口默认保存到 " DEFAULT_CONFIG_PATH "。</div></div></section>"
+        "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">推送目标</div><div class=\"hint\">同一条短信会发送到所有已启用且配置完整的目标。</div></div><div class=\"pad\">"
+        "<form method=\"post\" action=\"/save_config\"><input type=\"hidden\" id=\"targetCount\" name=\"target_count\" value=\"%d\"><input type=\"hidden\" id=\"targetIndex\" value=\"%d\">"
+        "<div class=\"targetbar\"><div><div class=\"title\">目标列表</div><div id=\"targetSummary\" class=\"targetstatus\">已启用 %d / %d 个目标</div></div><div class=\"actions\"><button id=\"addTargetButton\" type=\"button\" onclick=\"addTarget()\">新增目标</button><button class=\"alt\" type=\"button\" onclick=\"removeTarget()\">删除当前目标</button></div></div>"
+        "<div class=\"targetlist\">",
+        port, cfg.target_count, active < 0 ? 0 : active,
+        enabled_target_count(&cfg), cfg.target_count);
+    for (i = 0; i < ALICE_ENGINE_MAX_TARGETS; i++) {
+        const web_push_target_t *target = &cfg.targets[i];
+        const char *name = i < cfg.target_count ? target->name : "空位";
+        const char *type = i < cfg.target_count ?
+            (target_is_email(target) ? "邮箱" : "Webhook") : "未添加";
+        const char *status = i < cfg.target_count && target->enabled ? "启用" : "停用";
+        char esc_name[256];
+        html_escape(esc_name, sizeof(esc_name), name);
+        buf_append(body, WEB_BODY_MAX,
+                   "<button class=\"targetitem%s\" id=\"targetItem%d\" type=\"button\" onclick=\"selectTarget(%d)\"><div class=\"targetname\">%s</div><div class=\"targetmeta\">%s · %s</div></button>",
+                   i == active ? " active" : "", i, i, esc_name, status, type);
+    }
+    buf_append(body, WEB_BODY_MAX, "</div>");
+    for (i = 0; i < ALICE_ENGINE_MAX_TARGETS; i++)
+        append_target_panel(body, WEB_BODY_MAX, &cfg.targets[i], i, i == active);
+    buf_append(body, WEB_BODY_MAX,
+        "<section class=\"panel\" style=\"box-shadow:none;margin-top:14px\"><div class=\"formtop\"><div class=\"title\">短信来源与文本</div></div><div class=\"pad\">"
+        "<label>短信进程</label><select id=\"targetModeSelect\" name=\"target_mode\" onchange=\"toggleTargetProcess()\"><option value=\"mifi\"%s>ZTE MiFi（/sbin/zte_mifi）</option><option value=\"ufi\"%s>ZTE UFI（/sbin/zte_ufi）</option><option value=\"custom\"%s>自定义路径</option></select>"
+        "<div id=\"targetCustomFields\" class=\"custombox\"><label>自定义进程路径</label><input name=\"target_path\" value=\"%s\" placeholder=\"/sbin/zte_mifi\"><div class=\"hint\">填写 /proc/&lt;pid&gt;/exe 指向的可执行文件路径。</div></div>"
+        "<label>设备手机号，可留空自动读取 nv show</label><div class=\"fieldrow\"><input id=\"numInput\" name=\"num\" value=\"%s\" oninput=\"updatePreview()\"><button class=\"alt\" type=\"button\" onclick=\"fetchMsisdn(this)\">获取</button></div><div id=\"numMsg\" class=\"hint\">获取不到时可手动填写，也可以留空。</div>"
+        "<label>消息前缀</label><textarea id=\"headInput\" name=\"headtxt\" rows=\"3\" oninput=\"updatePreview()\">%s</textarea><label>消息后缀</label><textarea id=\"tailInput\" name=\"tailtxt\" rows=\"3\" oninput=\"updatePreview()\">%s</textarea>"
+        "<label>当前目标预览</label><div id=\"msgPreview\" class=\"preview\">请选择或新增一个目标。</div>"
+        "<div class=\"actions\"><button type=\"submit\">保存全部配置</button></div></div></section></form>"
+        "<div class=\"hint\">配置保存到 " DEFAULT_CONFIG_PATH "，权限 0600。邮箱目标使用目标设备已有的 mbedTLS，证书校验关闭。</div></div></section>",
+        target_selected_attr(cfg.target_mode, "mifi"), target_selected_attr(cfg.target_mode, "ufi"),
+        target_selected_attr(cfg.target_mode, "custom"), target_path, num, head, tail);
+    append_page_end(body, WEB_BODY_MAX);
+    http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
     free(body);
 }
 
@@ -1874,10 +2465,13 @@ static void render_status_json(int fd) {
     char auto_payload[512];
     char auto_script[512];
     char auto_error[512];
+    const char *delivery;
+    int webhook_configured;
+    int email_configured_flag;
     pid_t spid = service_pid();
     pid_t strpid = alice_engine_get_strace_pid();
     int target_pid;
-    char body[2048];
+    char body[3072];
 
     load_web_config(&cfg);
     get_autostart_status(&ast);
@@ -1892,11 +2486,17 @@ static void render_status_json(int fd) {
     json_escape(auto_payload, sizeof(auto_payload), ast.payload_path);
     json_escape(auto_script, sizeof(auto_script), ast.script_path);
     json_escape(auto_error, sizeof(auto_error), ast.error);
+    delivery = configured_delivery_mode(&cfg);
+    webhook_configured = strcmp(delivery, "webhook") == 0 ||
+                         strcmp(delivery, "multiple") == 0;
+    email_configured_flag = strcmp(delivery, "email") == 0 ||
+                            strcmp(delivery, "multiple") == 0;
     snprintf(body, sizeof(body),
         "{\"service_running\":%s,\"service_pid\":%ld,"
         "\"strace_pid\":%ld,\"target_pid\":%d,\"zte_mifi_pid\":%d,"
         "\"target_mode\":\"%s\",\"target_path\":\"%s\","
-        "\"webhook_configured\":%s,\"platform\":\"%s\","
+        "\"delivery\":\"%s\",\"target_count\":%d,\"enabled_target_count\":%d,"
+        "\"webhook_configured\":%s,\"email_configured\":%s,\"platform\":\"%s\","
         "\"num\":\"%s\",\"port\":%d,"
         "\"wonder_detected\":%s,\"persistence_mode\":\"%s\","
         "\"payload_ready\":%s,\"payload_path\":\"%s\","
@@ -1907,7 +2507,11 @@ static void render_status_json(int fd) {
         spid > 0 ? "true" : "false", (long)spid, (long)strpid,
         target_pid > 0 ? target_pid : 0,
         target_pid > 0 ? target_pid : 0, target_mode, target_path,
-        cfg.webhook[0] ? "true" : "false", platform, num, g_webui_port,
+        delivery,
+        cfg.target_count, enabled_target_count(&cfg),
+        webhook_configured ? "true" : "false",
+        email_configured_flag ? "true" : "false",
+        platform, num, g_webui_port,
         ast.wonder_detected ? "true" : "false", auto_mode,
         ast.payload_ready ? "true" : "false", auto_payload,
         ast.script_ready ? "true" : "false", ast.entry_ready ? "true" : "false",
@@ -1931,12 +2535,18 @@ static void render_msisdn_json(int fd) {
     http_send(fd, 200, "OK", "application/json; charset=utf-8", body);
 }
 
-static void handle_save_config(int fd, const char *body) {
+#if 0
+static void handle_save_config_legacy(int fd, const char *body) {
     web_config_t cfg;
+    char submitted_password[256];
+    int submitted_password_present;
+    int smtp_port;
     int saved_port;
 
     load_web_config(&cfg);
     saved_port = cfg.port > 0 ? cfg.port : DEFAULT_WEBUI_PORT;
+    if (!form_value(body, "delivery", cfg.delivery, sizeof(cfg.delivery)))
+        safe_copy(cfg.delivery, sizeof(cfg.delivery), DELIVERY_WEBHOOK);
     form_value(body, "webhook", cfg.webhook, sizeof(cfg.webhook));
     form_value(body, "platform", cfg.platform, sizeof(cfg.platform));
     form_value(body, "target_mode", cfg.target_mode, sizeof(cfg.target_mode));
@@ -1948,8 +2558,22 @@ static void handle_save_config(int fd, const char *body) {
     form_value(body, "num", cfg.num, sizeof(cfg.num));
     form_value(body, "headtxt", cfg.headtxt, sizeof(cfg.headtxt));
     form_value(body, "tailtxt", cfg.tailtxt, sizeof(cfg.tailtxt));
+    form_value(body, "smtp_host", cfg.smtp_host, sizeof(cfg.smtp_host));
+    form_value(body, "smtp_port", cfg.smtp_port, sizeof(cfg.smtp_port));
+    form_value(body, "smtp_user", cfg.smtp_user, sizeof(cfg.smtp_user));
+    submitted_password_present = form_value(body, "smtp_password",
+                                             submitted_password,
+                                             sizeof(submitted_password));
+    if (submitted_password_present && submitted_password[0])
+        safe_copy(cfg.smtp_password, sizeof(cfg.smtp_password),
+                  submitted_password);
+    form_value(body, "smtp_from", cfg.smtp_from, sizeof(cfg.smtp_from));
+    form_value(body, "smtp_to", cfg.smtp_to, sizeof(cfg.smtp_to));
+    form_value(body, "smtp_security", cfg.smtp_security,
+               sizeof(cfg.smtp_security));
     cfg.port = saved_port;
     remove_newlines(cfg.webhook);
+    safe_copy(cfg.delivery, sizeof(cfg.delivery), normalize_delivery(cfg.delivery));
     safe_copy(cfg.platform, sizeof(cfg.platform),
               normalize_platform(cfg.platform));
     safe_copy(cfg.target_mode, sizeof(cfg.target_mode),
@@ -1968,12 +2592,39 @@ static void handle_save_config(int fd, const char *body) {
         safe_copy(cfg.custom_ctype, sizeof(cfg.custom_ctype),
                   "application/json;charset=utf-8");
     remove_newlines(cfg.num);
-    if (!cfg.webhook[0]) {
-        ring_log_append("[WEBUI] config save rejected: webhook is empty");
-        render_config(fd, "Webhook 不能为空。");
+    remove_newlines(cfg.smtp_host);
+    remove_newlines(cfg.smtp_port);
+    remove_newlines(cfg.smtp_user);
+    remove_newlines(cfg.smtp_password);
+    remove_newlines(cfg.smtp_from);
+    remove_newlines(cfg.smtp_to);
+    safe_copy(cfg.smtp_security, sizeof(cfg.smtp_security),
+              normalize_smtp_security(cfg.smtp_security));
+    if (!cfg.smtp_port[0])
+        safe_copy(cfg.smtp_port, sizeof(cfg.smtp_port), "587");
+    if (delivery_is_email(&cfg))
+        cfg.webhook[0] = 0;
+    else
+        clear_email_target(&cfg);
+    if ((cfg.smtp_host[0] || cfg.smtp_user[0] || cfg.smtp_password[0] ||
+         cfg.smtp_from[0] || cfg.smtp_to[0]) &&
+        delivery_is_email(&cfg) && !email_configured(&cfg)) {
+        ring_log_append("[WEBUI] config save rejected: incomplete smtp target");
+        render_config(fd, "邮箱方式需要同时填写 SMTP 服务器、发件人和收件人。");
         return;
     }
-    if (strcmp(normalize_platform(cfg.platform), "custom") == 0 &&
+    if (delivery_is_email(&cfg) && email_configured(&cfg) &&
+        parse_port_text(cfg.smtp_port, &smtp_port) < 0) {
+        ring_log_append("[WEBUI] config save rejected: invalid smtp port");
+        render_config(fd, "SMTP 端口无效，请输入 1-65535 的数字。");
+        return;
+    }
+    if (!any_target_configured(&cfg)) {
+        ring_log_append("[WEBUI] config save rejected: no push target");
+        render_config(fd, "请选择 Webhook 或邮箱，并完成对应配置。");
+        return;
+    }
+    if (cfg.webhook[0] && strcmp(normalize_platform(cfg.platform), "custom") == 0 &&
         !cfg.custom_body[0]) {
         ring_log_append("[WEBUI] config save rejected: custom body is empty");
         render_config(fd, "自定义消息体模板不能为空。");
@@ -1984,10 +2635,159 @@ static void handle_save_config(int fd, const char *body) {
         render_config(fd, "配置保存失败，请检查 /mnt/userdata 是否可写。");
         return;
     }
-    ring_log_append("[WEBUI] config saved platform=%s target=%s",
-                    normalize_platform(cfg.platform),
+    ring_log_append("[WEBUI] config saved delivery=%s platform=%s target=%s",
+                    normalize_delivery(cfg.delivery),
+                    configured_platform_label(&cfg),
                     normalize_target_mode(cfg.target_mode));
     render_config(fd, "配置已保存。");
+}
+#endif
+
+static void handle_save_config(int fd, const char *body) {
+    web_config_t cfg;
+    char value[64];
+    char submitted_password[256];
+    char previous_password[256];
+    int submitted_password_present;
+    int count;
+    int i;
+    int active_count = 0;
+    char *count_end;
+    long parsed_count;
+
+    load_web_config(&cfg);
+    form_value(body, "target_count", value, sizeof(value));
+    if (!value[0]) {
+        ring_log_append("[WEBUI] config save rejected: target count is empty");
+        render_config(fd, "目标数量无效，请至少添加一个目标。");
+        return;
+    }
+    errno = 0;
+    parsed_count = strtol(value, &count_end, 10);
+    while (*count_end == ' ' || *count_end == '\t' ||
+           *count_end == '\r' || *count_end == '\n')
+        count_end++;
+    if (errno || count_end == value || *count_end ||
+        parsed_count < 0 || parsed_count > ALICE_ENGINE_MAX_TARGETS) {
+        ring_log_append("[WEBUI] config save rejected: target count=%s", value);
+        render_config(fd, "目标数量无效，最多支持 4 个目标。");
+        return;
+    }
+    count = (int)parsed_count;
+    cfg.target_count = count;
+    form_value(body, "target_mode", cfg.target_mode, sizeof(cfg.target_mode));
+    form_value(body, "target_path", cfg.target_path, sizeof(cfg.target_path));
+    form_value(body, "num", cfg.num, sizeof(cfg.num));
+    form_value(body, "headtxt", cfg.headtxt, sizeof(cfg.headtxt));
+    form_value(body, "tailtxt", cfg.tailtxt, sizeof(cfg.tailtxt));
+    safe_copy(cfg.target_mode, sizeof(cfg.target_mode),
+              normalize_target_mode(cfg.target_mode));
+    remove_newlines(cfg.target_path);
+    remove_newlines(cfg.num);
+    remove_newlines(cfg.headtxt);
+    remove_newlines(cfg.tailtxt);
+    if (strcmp(cfg.target_mode, "custom") != 0) {
+        safe_copy(cfg.target_path, sizeof(cfg.target_path),
+                  target_default_path(cfg.target_mode));
+    } else if (!cfg.target_path[0] || cfg.target_path[0] != '/') {
+        ring_log_append("[WEBUI] config save rejected: invalid target path");
+        render_config(fd, "自定义进程路径必须填写绝对路径，例如 /sbin/zte_mifi。");
+        return;
+    }
+
+    for (i = 0; i < ALICE_ENGINE_MAX_TARGETS; i++) {
+        web_push_target_t *target = &cfg.targets[i];
+        char key[64];
+
+        snprintf(key, sizeof(key), "target_%d_enabled", i);
+        form_value(body, key, value, sizeof(value));
+        target->enabled = strcmp(value, "1") == 0;
+        snprintf(key, sizeof(key), "target_%d_name", i);
+        form_value(body, key, target->name, sizeof(target->name));
+        snprintf(key, sizeof(key), "target_%d_type", i);
+        form_value(body, key, target->type, sizeof(target->type));
+        snprintf(key, sizeof(key), "target_%d_platform", i);
+        form_value(body, key, target->platform, sizeof(target->platform));
+        snprintf(key, sizeof(key), "target_%d_webhook", i);
+        form_value(body, key, target->webhook, sizeof(target->webhook));
+        snprintf(key, sizeof(key), "target_%d_custom_ctype", i);
+        form_value(body, key, target->custom_ctype, sizeof(target->custom_ctype));
+        snprintf(key, sizeof(key), "target_%d_custom_body", i);
+        form_value(body, key, target->custom_body, sizeof(target->custom_body));
+        snprintf(key, sizeof(key), "target_%d_smtp_host", i);
+        form_value(body, key, target->smtp_host, sizeof(target->smtp_host));
+        snprintf(key, sizeof(key), "target_%d_smtp_port", i);
+        form_value(body, key, target->smtp_port, sizeof(target->smtp_port));
+        snprintf(key, sizeof(key), "target_%d_smtp_user", i);
+        form_value(body, key, target->smtp_user, sizeof(target->smtp_user));
+        safe_copy(previous_password, sizeof(previous_password), target->smtp_password);
+        snprintf(key, sizeof(key), "target_%d_smtp_password", i);
+        submitted_password_present = form_value(body, key, submitted_password,
+                                                 sizeof(submitted_password));
+        if (submitted_password_present && submitted_password[0])
+            safe_copy(target->smtp_password, sizeof(target->smtp_password),
+                      submitted_password);
+        else
+            safe_copy(target->smtp_password, sizeof(target->smtp_password),
+                      previous_password);
+        snprintf(key, sizeof(key), "target_%d_smtp_from", i);
+        form_value(body, key, target->smtp_from, sizeof(target->smtp_from));
+        snprintf(key, sizeof(key), "target_%d_smtp_to", i);
+        form_value(body, key, target->smtp_to, sizeof(target->smtp_to));
+        snprintf(key, sizeof(key), "target_%d_smtp_security", i);
+        form_value(body, key, target->smtp_security, sizeof(target->smtp_security));
+
+        remove_newlines(target->name);
+        remove_newlines(target->webhook);
+        remove_newlines(target->custom_ctype);
+        remove_newlines(target->custom_body);
+        remove_newlines(target->smtp_host);
+        remove_newlines(target->smtp_port);
+        remove_newlines(target->smtp_user);
+        remove_newlines(target->smtp_password);
+        remove_newlines(target->smtp_from);
+        remove_newlines(target->smtp_to);
+        normalize_push_target(target, i);
+        clear_target_inactive_fields(target);
+        if (i >= count)
+            target->enabled = 0;
+        if (!target->enabled)
+            continue;
+        if (!target_configured(target)) {
+            ring_log_append("[WEBUI] config save rejected: target %d incomplete", i + 1);
+            render_config(fd, target_is_email(target) ?
+                          "启用的邮箱目标需要填写 SMTP 服务器、发件人和收件人。" :
+                          "启用的 Webhook 目标需要填写 URL。");
+            return;
+        }
+        if (target_is_email(target)) {
+            int smtp_port;
+            if (parse_port_text(target->smtp_port, &smtp_port) < 0) {
+                ring_log_append("[WEBUI] config save rejected: target %d invalid smtp port", i + 1);
+                render_config(fd, "邮箱目标的 SMTP 端口无效，请输入 1-65535 的数字。");
+                return;
+            }
+        } else if (strcmp(normalize_platform(target->platform), "custom") == 0 &&
+                   !target->custom_body[0]) {
+            ring_log_append("[WEBUI] config save rejected: target %d custom body empty", i + 1);
+            render_config(fd, "自定义 Webhook 目标的消息体模板不能为空。");
+            return;
+        }
+        active_count++;
+    }
+    if (!active_count) {
+        ring_log_append("[WEBUI] config save rejected: no enabled target");
+        render_config(fd, "请至少启用并完成一个推送目标。");
+        return;
+    }
+    if (save_web_config(&cfg) < 0) {
+        ring_log_append("[WEBUI] config save failed errno=%d", errno);
+        render_config(fd, "配置保存失败，请检查 /mnt/userdata 是否可写。");
+        return;
+    }
+    ring_log_append("[WEBUI] config saved targets=%d enabled=%d", cfg.target_count,
+                    active_count);
+    render_config(fd, "多目标配置已保存。");
 }
 
 static void handle_set_port(int fd, const char *body) {
@@ -2072,7 +2872,7 @@ static void handle_start(int fd, const char *self_path) {
     load_web_config(&cfg);
     if (start_service(self_path, &cfg) < 0) {
         ring_log_append("[WEBUI] start action failed errno=%d", errno);
-        render_home(fd, "启动失败：请先保存有效 Webhook，或查看日志。");
+        render_home(fd, "启动失败：请先保存有效的推送目标，或查看日志。");
         return;
     }
     ring_log_append("[WEBUI] start action completed");
@@ -2091,7 +2891,7 @@ static void handle_restart(int fd, const char *self_path) {
     stop_service();
     if (start_service(self_path, &cfg) < 0) {
         ring_log_append("[WEBUI] restart action failed errno=%d", errno);
-        render_home(fd, "重启失败：请先保存有效 Webhook，或查看日志。");
+        render_home(fd, "重启失败：请先保存有效的推送目标，或查看日志。");
         return;
     }
     ring_log_append("[WEBUI] restart action completed");
@@ -2106,7 +2906,7 @@ static int run_test_message(const web_config_t *cfg, const char *txt) {
     alice_engine_build_push_message(final_txt, sizeof(final_txt),
                                     cfg->headtxt, txt, cfg->tailtxt);
     ring_log_append("[WEBUI] test message sending platform=%s",
-                    normalize_platform(cfg->platform));
+                    configured_platform_label(cfg));
 
     pid = fork();
     if (pid < 0) {
@@ -2114,14 +2914,17 @@ static int run_test_message(const web_config_t *cfg, const char *txt) {
         return -1;
     }
     if (pid == 0) {
+        alice_engine_push_target_t engine_targets[ALICE_ENGINE_MAX_TARGETS];
         int rc;
 
         alice_engine_set_log_callback(engine_ring_log_callback, NULL);
         ring_log_append("[WEBUI] test message child started platform=%s",
-                        normalize_platform(cfg->platform));
-        rc = alice_engine_send_once(cfg->webhook, normalize_platform(cfg->platform),
-                                    final_txt, cfg->custom_ctype,
-                                    cfg->custom_body);
+                        configured_platform_label(cfg));
+        rc = alice_engine_send_target_list(
+            engine_targets,
+            build_engine_target_list(cfg, engine_targets,
+                                     ALICE_ENGINE_MAX_TARGETS),
+            final_txt);
         _exit(rc == 0 ? 0 : 1);
     }
     while (waitpid(pid, &status, 0) < 0) {
@@ -2146,18 +2949,18 @@ static void handle_test(int fd, const char *self_path, const char *body) {
 
     (void)self_path;
     load_web_config(&cfg);
-    if (!cfg.webhook[0]) {
-        ring_log_append("[WEBUI] test message rejected: webhook is empty");
-        render_home(fd, "请先保存 Webhook。");
+    if (!any_target_configured(&cfg)) {
+        ring_log_append("[WEBUI] test message rejected: no push target");
+        render_home(fd, "请先保存有效的推送目标。");
         return;
     }
     if (!form_value(body, "txt", txt, sizeof(txt)) || !txt[0])
         safe_copy(txt, sizeof(txt), "Alice Pusher Bot 测试消息");
     remove_newlines(txt);
     if (run_test_message(&cfg, txt) == 0) {
-        render_home(fd, "测试消息已发送，请检查 Webhook 返回和运行日志。");
+        render_home(fd, "测试消息已发送，请检查当前推送方式的返回和运行日志。");
     } else {
-        render_home(fd, "测试消息发送失败，请检查 Webhook 和运行日志。");
+        render_home(fd, "测试消息发送失败，请检查当前推送方式和运行日志。");
     }
 }
 

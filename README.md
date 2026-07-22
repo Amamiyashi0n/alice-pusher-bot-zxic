@@ -39,6 +39,11 @@
    sh ./make.sh
    ```
 
+   如果当前目录旁边存在 `../alice-buildroot/output-target`，脚本会自动使用其中与目标设备匹配的 ARM/uClibc 工具链。也可以显式指定 Buildroot 输出目录：
+   ```bash
+   ALICE_BUILDROOT_OUTPUT=/path/to/alice-buildroot/output-target sh ./make.sh
+   ```
+
 3. 编译成功后，可执行文件将生成在当前目录或 `output/` 目录下（视 make.sh 脚本逻辑而定）。
 
 ---
@@ -46,7 +51,7 @@
 ## 源码结构
 
 - `src/webui.c`：WebUI、配置、自启动、服务管理和 CLI 入口。
-- `src/alice-pusher-bot.c`：PDU 解码、strace 跟踪和 Webhook 推送引擎核心。
+- `src/alice-pusher-bot.c`：PDU 解码、strace 跟踪、Webhook 和 SMTP 邮箱推送引擎核心。
 - `src/alice-pusher-bot.h`：WebUI 调用引擎核心的公共接口。
 
 ---
@@ -54,6 +59,7 @@
 ## 注意事项
 
 - 请确保您的系统环境满足依赖要求。
+- WebUI 支持最多 4 个推送目标；Webhook 和 SMTP 邮箱均可作为独立目标同时启用，每个目标使用独立的平台、地址和模板配置。邮箱使用目标设备已有的 mbedTLS，支持明文、STARTTLS 和隐式 TLS。
 - 项目仅用于技术交流，请勿用于任何违法用途。
 
 ---
