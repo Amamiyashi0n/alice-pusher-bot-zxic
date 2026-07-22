@@ -24,6 +24,11 @@ if [ -n "$runtime_dir" ]; then
 	runtime_enabled=1
 fi
 
+trace_helper_enabled=0
+if [ -n "$runtime_dir" ] && [ -x "$runtime_dir/sms-ptrace" ]; then
+	trace_helper_enabled=1
+fi
+
 tmp="${output}.tmp"
 zip_tmp="${output}.ziptmp"
 rm -f "$tmp" "$zip_tmp"
@@ -53,6 +58,7 @@ set -eu
 app_size=$app_size
 app_stamp=$app_stamp
 runtime_enabled=$runtime_enabled
+trace_helper_enabled=$trace_helper_enabled
 SCRIPT
 
 cat >>"$tmp" <<'SCRIPT'
@@ -75,12 +81,15 @@ zip="${out}.$$.zip"
 stamp="${out}.stamp"
 lib_out="${out}.lib"
 lib_tmp="${lib_out}.$$"
+trace_helper_out="${out}.sms-ptrace"
+trace_helper_tmp="${trace_helper_out}.$$"
 marker="__ALICE_PUSHER_ZIP_PAYLOAD_BELOW__"
 
 trap '' HUP
 mount -o remount,exec /tmp 2>/dev/null || true
 rm -f "$tmp" "$zip"
 rm -rf "$lib_tmp"
+rm -f "$trace_helper_tmp"
 
 runtime_ready()
 {
@@ -90,12 +99,24 @@ runtime_ready()
 	[ -f "$lib_out/libmbedcrypto.so.0" ] &&
 	[ -f "$lib_out/libmbedx509.so.0" ] &&
 	[ -f "$lib_out/libmbedtls.so.10" ]
+	if [ "$trace_helper_enabled" = 1 ]; then
+		[ -x "$trace_helper_out" ]
+	fi
 }
 
 run_app()
 {
 	if [ "$runtime_enabled" = 1 ]; then
+		if [ "$trace_helper_enabled" = 1 ]; then
+			ALICE_PUSHER_TRACE_HELPER="$trace_helper_out" \
+			LD_LIBRARY_PATH="$lib_out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+			ALICE_PUSHER_RUN_SOURCE="$self" exec "$out" "$@"
+		fi
 		LD_LIBRARY_PATH="$lib_out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+			ALICE_PUSHER_RUN_SOURCE="$self" exec "$out" "$@"
+	fi
+	if [ "$trace_helper_enabled" = 1 ]; then
+		ALICE_PUSHER_TRACE_HELPER="$trace_helper_out" \
 			ALICE_PUSHER_RUN_SOURCE="$self" exec "$out" "$@"
 	fi
 	ALICE_PUSHER_RUN_SOURCE="$self" exec "$out" "$@"
@@ -134,28 +155,36 @@ fi
 if [ "$runtime_enabled" = 1 ]; then
 	mkdir -p "$lib_tmp"
 	if ! unzip -q "$zip" 'lib/*' -d "$lib_tmp"; then
-		rm -rf "$tmp" "$zip" "$lib_tmp"
+		rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
 		echo "runtime library extraction failed" >&2
 		exit 1
 	fi
 	if [ ! -f "$lib_tmp/lib/libmbedcrypto.so.0" ] ||
 	   [ ! -f "$lib_tmp/lib/libmbedx509.so.0" ] ||
 	   [ ! -f "$lib_tmp/lib/libmbedtls.so.10" ]; then
-		rm -rf "$tmp" "$zip" "$lib_tmp"
+		rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
 		echo "runtime libraries missing from payload" >&2
 		exit 1
+	fi
+	if [ "$trace_helper_enabled" = 1 ]; then
+		if [ ! -f "$lib_tmp/lib/sms-ptrace" ]; then
+			rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
+			echo "sms-ptrace missing from payload" >&2
+			exit 1
+		fi
+		chmod 755 "$lib_tmp/lib/sms-ptrace"
 	fi
 fi
 
 if ! unzip -p "$zip" alice-pusher-bot >"$tmp"; then
-	rm -rf "$tmp" "$zip" "$lib_tmp"
+	rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
 	echo "extract failed" >&2
 	exit 1
 fi
 rm -f "$zip"
 
 if [ ! -s "$tmp" ]; then
-	rm -rf "$tmp" "$lib_tmp"
+	rm -rf "$tmp" "$lib_tmp" "$trace_helper_tmp"
 	echo "extract failed" >&2
 	exit 1
 fi
@@ -166,6 +195,10 @@ if [ "$runtime_enabled" = 1 ]; then
 	rm -rf "$lib_out"
 	mv "$lib_tmp/lib" "$lib_out"
 	rmdir "$lib_tmp" 2>/dev/null || true
+fi
+if [ "$trace_helper_enabled" = 1 ]; then
+	mv "$lib_out/sms-ptrace" "$trace_helper_tmp"
+	mv "$trace_helper_tmp" "$trace_helper_out"
 fi
 echo "$app_stamp" >"$stamp" 2>/dev/null || true
 run_app "$@"

@@ -196,9 +196,15 @@ static int start_strace_with_pipe(int target_pid, pid_t *out_strace_pid, int *ou
         close(fds[1]);
 
         char pidstr[16];
+        const char *trace_helper = getenv("ALICE_PUSHER_TRACE_HELPER");
         snprintf(pidstr, sizeof(pidstr), "%d", target_pid);
-        execl("/tmp/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, (char*)NULL);
-        execl("/sbin/strace", "strace", "-f", "-e", "trace=read,write", "-s", "1024", "-p", pidstr, (char*)NULL);
+        if (!trace_helper || !trace_helper[0]) {
+            static const char message[] =
+                "sms-ptrace helper path is not configured\n";
+            write(STDERR_FILENO, message, sizeof(message) - 1);
+            _exit(127);
+        }
+        execl(trace_helper, "sms-ptrace", "-p", pidstr, (char*)NULL);
         _exit(127);
     }
 

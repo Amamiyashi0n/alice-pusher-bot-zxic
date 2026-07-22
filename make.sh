@@ -31,6 +31,8 @@ EMBED_ASSET="$ROOT_DIR/tools/embed_asset.py"
 SELF_EXTRACT="$ROOT_DIR/tools/make_self_extract.sh"
 AVATAR_SRC="$ROOT_DIR/pic/miku_compressed.jpg"
 SPONSOR_SRC="$ROOT_DIR/pic/sponsor_clean.jpg"
+TRACE_HELPER_SRC="$ROOT_DIR/tools/sms-ptrace-helper.c"
+TRACE_HELPER_TARGET="$BUILD_DIR/sms-ptrace"
 MBEDTLS_CRYPTO_SO="$MBEDTLS_DIR/library/libmbedcrypto.so.0"
 MBEDTLS_X509_SO="$MBEDTLS_DIR/library/libmbedx509.so.0"
 MBEDTLS_TLS_SO="$MBEDTLS_DIR/library/libmbedtls.so.10"
@@ -94,6 +96,16 @@ copy_mbedtls_runtime() {
 	done
 }
 
+build_trace_helper() {
+	need_file "$TRACE_HELPER_SRC"
+	"$CC" $ENGINE_CFLAGS "$TRACE_HELPER_SRC" -o "$TRACE_HELPER_TARGET" \
+		$LDFLAGS
+	"$STRIP" --strip-all "$TRACE_HELPER_TARGET"
+	cp -Lf "$TRACE_HELPER_TARGET" "$RUNTIME_DIR/sms-ptrace"
+	chmod 755 "$RUNTIME_DIR/sms-ptrace"
+	find "$RUNTIME_DIR" -maxdepth 1 -type f -name strace -delete
+}
+
 need_exec "$CC"
 need_exec "$STRIP"
 need_file "$WEBUI_SRC"
@@ -102,6 +114,7 @@ need_file "$EMBED_ASSET"
 need_file "$SELF_EXTRACT"
 need_file "$AVATAR_SRC"
 need_file "$SPONSOR_SRC"
+need_file "$TRACE_HELPER_SRC"
 need_file "$MBEDTLS_DIR/include/mbedtls/ssl.h"
 
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
@@ -112,6 +125,7 @@ python3 "$EMBED_ASSET" "$SPONSOR_SRC" "$BUILD_DIR/sponsor_asset.h" sponsor_image
 
 build_mbedtls_if_needed
 copy_mbedtls_runtime
+build_trace_helper
 
 # GCC 4.7.2 crashes while optimizing webui.c; optimize the smaller engine separately.
 "$CC" $CFLAGS -I"$MBEDTLS_DIR/include" -c "$WEBUI_SRC" -o "$WEBUI_OBJECT"

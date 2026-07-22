@@ -1942,10 +1942,14 @@ static void append_page_start(char *body, size_t bodysz, const char *active,
                               const char *title, const char *subtitle,
                               const char *message) {
     char esc_msg[1024];
+    const char *msg_class = "";
     if (message && message[0])
         html_escape(esc_msg, sizeof(esc_msg), message);
     else
         esc_msg[0] = 0;
+    if (message && (strstr(message, "失败") || strstr(message, "无效") ||
+                    strstr(message, "错误")))
+        msg_class = " error";
     buf_append(body, bodysz,
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -1976,7 +1980,8 @@ static void append_page_start(char *body, size_t bodysz, const char *active,
         strcmp(active, "about") == 0 ? "active" : "",
         g_webui_port, title, subtitle);
     if (esc_msg[0])
-        buf_append(body, bodysz, "<div class=\"msg\">%s</div>", esc_msg);
+        buf_append(body, bodysz, "<div class=\"msg%s\">%s</div>",
+                   msg_class, esc_msg);
 }
 
 static void append_page_end(char *body, size_t bodysz) {
@@ -3084,116 +3089,154 @@ static const char *validate_target(const web_push_target_t *target) {
 }
 
 static void handle_target_save(int fd, const char *body) {
-    web_config_t cfg;
-    web_push_target_t target;
+    web_config_t *cfg = calloc(1, sizeof(*cfg));
+    web_push_target_t *target = calloc(1, sizeof(*target));
     char value[64];
     const char *error;
     int index;
 
-    load_web_config(&cfg);
+    if (!cfg || !target) {
+        free(cfg);
+        free(target);
+        http_send(fd, 500, "Internal Server Error", "text/plain",
+                  "out of memory\n");
+        return;
+    }
+    load_web_config(cfg);
     if (!form_value(body, "target_index", value, sizeof(value)) ||
         parse_target_index_value(value, &index) < 0 ||
-        index > cfg.target_count) {
+        index > cfg->target_count) {
+        free(cfg);
+        free(target);
         render_config(fd, "任务索引无效。");
         return;
     }
-    if (index == cfg.target_count) {
-        init_push_target(&target, index);
-        target.enabled = 1;
+    if (index == cfg->target_count) {
+        init_push_target(target, index);
+        target->enabled = 1;
     } else {
-        target = cfg.targets[index];
+        *target = cfg->targets[index];
     }
-    load_target_form(body, &target, index);
-    form_value(body, "target_mode", cfg.target_mode, sizeof(cfg.target_mode));
-    form_value(body, "target_path", cfg.target_path, sizeof(cfg.target_path));
-    safe_copy(cfg.target_mode, sizeof(cfg.target_mode),
-              normalize_target_mode(cfg.target_mode));
-    remove_newlines(cfg.target_path);
-    if (strcmp(cfg.target_mode, "custom") != 0) {
-        safe_copy(cfg.target_path, sizeof(cfg.target_path),
-                  target_default_path(cfg.target_mode));
-    } else if (!cfg.target_path[0] || cfg.target_path[0] != '/') {
+    load_target_form(body, target, index);
+    form_value(body, "target_mode", cfg->target_mode, sizeof(cfg->target_mode));
+    form_value(body, "target_path", cfg->target_path, sizeof(cfg->target_path));
+    safe_copy(cfg->target_mode, sizeof(cfg->target_mode),
+              normalize_target_mode(cfg->target_mode));
+    remove_newlines(cfg->target_path);
+    if (strcmp(cfg->target_mode, "custom") != 0) {
+        safe_copy(cfg->target_path, sizeof(cfg->target_path),
+                  target_default_path(cfg->target_mode));
+    } else if (!cfg->target_path[0] || cfg->target_path[0] != '/') {
         ring_log_append("[WEBUI] target save rejected: invalid target path");
         render_target_editor(fd,
                              "自定义进程路径必须填写绝对路径，例如 /sbin/zte_mifi。",
-                             index, &target, &cfg);
+                             index, target, cfg);
+        free(cfg);
+        free(target);
         return;
     }
-    error = validate_target(&target);
+    error = validate_target(target);
     if (error) {
         ring_log_append("[WEBUI] target save rejected: index=%d", index);
-        render_target_editor(fd, error, index, &target, &cfg);
+        render_target_editor(fd, error, index, target, cfg);
+        free(cfg);
+        free(target);
         return;
     }
-    cfg.targets[index] = target;
-    if (index == cfg.target_count)
-        cfg.target_count++;
-    if (save_web_config(&cfg) < 0) {
+    cfg->targets[index] = *target;
+    if (index == cfg->target_count)
+        cfg->target_count++;
+    if (save_web_config(cfg) < 0) {
         ring_log_append("[WEBUI] target save failed index=%d errno=%d", index, errno);
         render_target_editor(fd, "任务保存失败，请检查 /mnt/userdata 是否可写。",
-                             index, &target, &cfg);
+                             index, target, cfg);
+        free(cfg);
+        free(target);
         return;
     }
     ring_log_append("[WEBUI] target saved index=%d enabled=%d", index,
-                    target.enabled);
+                    target->enabled);
+    free(cfg);
+    free(target);
     render_config(fd, "推送任务已保存。");
 }
 
 static void handle_target_toggle(int fd, const char *body) {
-    web_config_t cfg;
+    web_config_t *cfg = calloc(1, sizeof(*cfg));
     char value[64];
     const char *error;
     int index;
 
-    load_web_config(&cfg);
+    if (!cfg) {
+        http_send(fd, 500, "Internal Server Error", "text/plain",
+                  "out of memory\n");
+        return;
+    }
+    load_web_config(cfg);
     if (!form_value(body, "target_index", value, sizeof(value)) ||
         parse_target_index_value(value, &index) < 0 ||
-        index >= cfg.target_count) {
+        index >= cfg->target_count) {
+        free(cfg);
         render_config(fd, "任务索引无效。");
         return;
     }
-    cfg.targets[index].enabled = !cfg.targets[index].enabled;
-    normalize_push_target(&cfg.targets[index], index);
-    error = validate_target(&cfg.targets[index]);
+    cfg->targets[index].enabled = !cfg->targets[index].enabled;
+    normalize_push_target(&cfg->targets[index], index);
+    error = validate_target(&cfg->targets[index]);
     if (error) {
-        cfg.targets[index].enabled = 0;
+        cfg->targets[index].enabled = 0;
         ring_log_append("[WEBUI] target enable rejected: index=%d", index);
-        render_target_editor(fd, error, index, &cfg.targets[index], &cfg);
+        render_target_editor(fd, error, index, &cfg->targets[index], cfg);
+        free(cfg);
         return;
     }
-    if (save_web_config(&cfg) < 0) {
+    if (save_web_config(cfg) < 0) {
         ring_log_append("[WEBUI] target toggle failed index=%d errno=%d", index, errno);
+        free(cfg);
         render_config(fd, "任务状态保存失败，请检查 /mnt/userdata 是否可写。");
         return;
     }
     ring_log_append("[WEBUI] target toggled index=%d enabled=%d", index,
-                    cfg.targets[index].enabled);
-    render_config(fd, cfg.targets[index].enabled ? "推送任务已启用。" : "推送任务已停用。");
+                    cfg->targets[index].enabled);
+    {
+        const char *message = cfg->targets[index].enabled ?
+                              "推送任务已启用。" : "推送任务已停用。";
+        free(cfg);
+        render_config(fd, message);
+    }
 }
 
 static void handle_target_delete(int fd, const char *body) {
-    web_config_t cfg;
+    web_config_t *cfg = calloc(1, sizeof(*cfg));
     char value[64];
     int index;
 
-    load_web_config(&cfg);
+    if (!cfg) {
+        http_send(fd, 500, "Internal Server Error", "text/plain",
+                  "out of memory\n");
+        return;
+    }
+    load_web_config(cfg);
     if (!form_value(body, "target_index", value, sizeof(value)) ||
         parse_target_index_value(value, &index) < 0 ||
-        index >= cfg.target_count) {
+        index >= cfg->target_count) {
+        free(cfg);
         render_config(fd, "任务索引无效。");
         return;
     }
-    if (index + 1 < cfg.target_count)
-        memmove(&cfg.targets[index], &cfg.targets[index + 1],
-                (size_t)(cfg.target_count - index - 1) * sizeof(cfg.targets[0]));
-    cfg.target_count--;
-    init_push_target(&cfg.targets[cfg.target_count], cfg.target_count);
-    if (save_web_config(&cfg) < 0) {
+    if (index + 1 < cfg->target_count)
+        memmove(&cfg->targets[index], &cfg->targets[index + 1],
+                (size_t)(cfg->target_count - index - 1) * sizeof(cfg->targets[0]));
+    cfg->target_count--;
+    init_push_target(&cfg->targets[cfg->target_count], cfg->target_count);
+    if (save_web_config(cfg) < 0) {
         ring_log_append("[WEBUI] target delete failed index=%d errno=%d", index, errno);
+        free(cfg);
         render_config(fd, "任务删除失败，请检查 /mnt/userdata 是否可写。");
         return;
     }
     ring_log_append("[WEBUI] target deleted index=%d", index);
+    free(cfg);
     render_config(fd, "推送任务已删除。");
 }
 
@@ -3340,45 +3383,21 @@ static void handle_restart(int fd, const char *self_path) {
 }
 
 static int run_test_message(const web_config_t *cfg, const char *txt) {
-    pid_t pid;
-    int status = 0;
+    alice_engine_push_target_t engine_targets[ALICE_ENGINE_MAX_TARGETS];
+    size_t target_count;
+    int rc;
 
+    if (!cfg || !txt)
+        return -1;
     ring_log_append("[WEBUI] test message sending platform=%s",
                     configured_platform_label(cfg));
-
-    pid = fork();
-    if (pid < 0) {
-        ring_log_append("[WEBUI] test message fork failed errno=%d", errno);
-        return -1;
-    }
-    if (pid == 0) {
-        alice_engine_push_target_t engine_targets[ALICE_ENGINE_MAX_TARGETS];
-        int rc;
-
-        alice_engine_set_log_callback(engine_ring_log_callback, NULL);
-        ring_log_append("[WEBUI] test message child started platform=%s",
-                        configured_platform_label(cfg));
-        rc = alice_engine_send_target_list(
-            engine_targets,
-            build_engine_target_list(cfg, engine_targets,
-                                     ALICE_ENGINE_MAX_TARGETS),
-            txt);
-        _exit(rc == 0 ? 0 : 1);
-    }
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            ring_log_append("[WEBUI] test message wait failed errno=%d", errno);
-            return -1;
-        }
-    }
-    if (WIFEXITED(status)) {
-        ring_log_append("[WEBUI] test message finished rc=%d",
-                        WEXITSTATUS(status));
-        trim_log_file();
-        return WEXITSTATUS(status);
-    }
-    ring_log_append("[WEBUI] test message ended abnormally");
-    return -1;
+    alice_engine_set_log_callback(engine_ring_log_callback, NULL);
+    target_count = build_engine_target_list(
+        cfg, engine_targets, ALICE_ENGINE_MAX_TARGETS);
+    rc = alice_engine_send_target_list(engine_targets, target_count, txt);
+    ring_log_append("[WEBUI] test message finished rc=%d", rc);
+    trim_log_file();
+    return rc;
 }
 
 static void handle_test(int fd, const char *self_path, const char *body) {
@@ -3398,53 +3417,89 @@ static void handle_test(int fd, const char *self_path, const char *body) {
     if (run_test_message(&cfg, txt) == 0) {
         render_home(fd, "测试消息已发送，请检查当前推送方式的返回和运行日志。");
     } else {
-        render_home(fd, "测试消息发送失败，请检查当前推送方式和运行日志。");
+        render_home(fd,
+                    "测试消息发送失败：目标设备当前无法连接 Webhook 网络，可能未联网、缺少默认路由或 DNS；请检查设备网络和运行日志。");
     }
 }
 
 static void handle_target_test(int fd, const char *body) {
-    web_config_t cfg;
-    web_config_t test_cfg;
-    web_push_target_t target;
+    web_config_t *cfg = calloc(1, sizeof(*cfg));
+    web_config_t *test_cfg = calloc(1, sizeof(*test_cfg));
+    web_push_target_t *target = calloc(1, sizeof(*target));
     char value[64];
     const char *error;
     int index;
 
-    load_web_config(&cfg);
+    if (!cfg || !test_cfg || !target) {
+        free(cfg);
+        free(test_cfg);
+        free(target);
+        http_send(fd, 500, "Internal Server Error", "text/plain",
+                  "out of memory\n");
+        return;
+    }
+    load_web_config(cfg);
     if (!form_value(body, "target_index", value, sizeof(value)) ||
         parse_target_index_value(value, &index) < 0 ||
-        index > cfg.target_count) {
+        index > cfg->target_count) {
+        free(cfg);
+        free(test_cfg);
+        free(target);
         render_config(fd, "任务索引无效。");
         return;
     }
-    if (index == cfg.target_count) {
-        init_push_target(&target, index);
-        target.enabled = 1;
+    if (index == cfg->target_count) {
+        init_push_target(target, index);
+        target->enabled = 1;
     } else {
-        target = cfg.targets[index];
+        *target = cfg->targets[index];
     }
-    load_target_form(body, &target, index);
-    target.enabled = 1;
-    error = validate_target(&target);
+    load_target_form(body, target, index);
+    target->enabled = 1;
+    form_value(body, "target_mode", cfg->target_mode, sizeof(cfg->target_mode));
+    form_value(body, "target_path", cfg->target_path, sizeof(cfg->target_path));
+    safe_copy(cfg->target_mode, sizeof(cfg->target_mode),
+              normalize_target_mode(cfg->target_mode));
+    remove_newlines(cfg->target_path);
+    if (strcmp(cfg->target_mode, "custom") != 0) {
+        safe_copy(cfg->target_path, sizeof(cfg->target_path),
+                  target_default_path(cfg->target_mode));
+    } else if (!cfg->target_path[0] || cfg->target_path[0] != '/') {
+        render_target_editor(fd,
+                             "自定义进程路径必须填写绝对路径，例如 /sbin/zte_mifi。",
+                             index, target, cfg);
+        free(cfg);
+        free(test_cfg);
+        free(target);
+        return;
+    }
+    error = validate_target(target);
     if (error) {
         ring_log_append("[WEBUI] target test rejected: index=%d", index);
-        render_target_editor(fd, error, index, &target, &cfg);
+        render_target_editor(fd, error, index, target, cfg);
+        free(cfg);
+        free(test_cfg);
+        free(target);
         return;
     }
 
-    test_cfg = cfg;
-    memset(test_cfg.targets, 0, sizeof(test_cfg.targets));
-    test_cfg.targets[0] = target;
-    test_cfg.target_count = 1;
-    if (run_test_message(&test_cfg, "Alice Pusher Bot 测试消息") == 0) {
+    *test_cfg = *cfg;
+    memset(test_cfg->targets, 0, sizeof(test_cfg->targets));
+    test_cfg->targets[0] = *target;
+    test_cfg->target_count = 1;
+    if (run_test_message(test_cfg, "Alice Pusher Bot 测试消息") == 0) {
         ring_log_append("[WEBUI] target test succeeded: index=%d", index);
         render_target_editor(fd, "测试任务已发送，当前配置尚未保存。",
-                             index, &target, &cfg);
+                             index, target, cfg);
     } else {
         ring_log_append("[WEBUI] target test failed: index=%d", index);
-        render_target_editor(fd, "测试任务发送失败，当前配置尚未保存，请检查运行日志。",
-                             index, &target, &cfg);
+        render_target_editor(fd,
+                             "测试任务发送失败：目标设备当前无法连接 Webhook 网络，可能未联网、缺少默认路由或 DNS；请检查设备网络和运行日志。当前配置尚未保存。",
+                             index, target, cfg);
     }
+    free(cfg);
+    free(test_cfg);
+    free(target);
 }
 
 static int read_http_request(int fd, char *req, size_t reqsz, char **body_out) {
