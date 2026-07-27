@@ -7,18 +7,9 @@
 *.out
 *.err
 *.tmp
+*.pyc
+__pycache__/
 
-# In-tree CMake output generated when rebuilding mbedTLS
-/lib-src/mbedtls-2.1.14/CMakeCache.txt
-/lib-src/mbedtls-2.1.14/CMakeFiles/
-/lib-src/mbedtls-2.1.14/**/CMakeFiles/
-/lib-src/mbedtls-2.1.14/cmake_install.cmake
-/lib-src/mbedtls-2.1.14/**/cmake_install.cmake
-/lib-src/mbedtls-2.1.14/Makefile
-/lib-src/mbedtls-2.1.14/**/Makefile
-!/lib-src/mbedtls-2.1.14/tests/data_files/Makefile
-/lib-src/mbedtls-2.1.14/library/*.a
-/lib-src/mbedtls-2.1.14/library/*.so*
 /output/lib/
 
 # Editor and OS noise

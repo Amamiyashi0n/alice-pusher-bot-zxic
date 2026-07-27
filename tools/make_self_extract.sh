@@ -19,14 +19,14 @@ if [ -n "$runtime_dir" ] && [ ! -d "$runtime_dir" ]; then
 	exit 1
 fi
 
-runtime_enabled=0
-if [ -n "$runtime_dir" ]; then
-	runtime_enabled=1
-fi
-
 trace_helper_enabled=0
 if [ -n "$runtime_dir" ] && [ -x "$runtime_dir/sms-ptrace" ]; then
 	trace_helper_enabled=1
+fi
+tls_library_name=libalice-bearssl.so.0
+tls_runtime_enabled=0
+if [ -n "$runtime_dir" ] && [ -f "$runtime_dir/$tls_library_name" ]; then
+	tls_runtime_enabled=1
 fi
 
 tmp="${output}.tmp"
@@ -35,6 +35,14 @@ rm -f "$tmp" "$zip_tmp"
 
 app_size=$(wc -c <"$input" | tr -d ' ')
 app_stamp=$(cksum "$input" | awk '{ print $1 "-" $2 }')
+if [ "$tls_runtime_enabled" = 1 ]; then
+	tls_stamp=$(cksum "$runtime_dir/$tls_library_name" | awk '{ print $1 "-" $2 }')
+	app_stamp="$app_stamp-$tls_stamp"
+fi
+if [ "$trace_helper_enabled" = 1 ]; then
+	helper_stamp=$(cksum "$runtime_dir/sms-ptrace" | awk '{ print $1 "-" $2 }')
+	app_stamp="$app_stamp-$helper_stamp"
+fi
 
 python3 - "$input" "$zip_tmp" "$runtime_dir" <<'PY'
 import os
@@ -45,10 +53,12 @@ src, dst, runtime_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
     zf.write(src, "alice-pusher-bot")
     if runtime_dir:
-        for name in sorted(os.listdir(runtime_dir)):
-            path = os.path.join(runtime_dir, name)
-            if os.path.isfile(path):
-                zf.write(path, "lib/" + name)
+        tls_library = os.path.join(runtime_dir, "libalice-bearssl.so.0")
+        if os.path.isfile(tls_library):
+            zf.write(tls_library, "lib/libalice-bearssl.so.0")
+        helper = os.path.join(runtime_dir, "sms-ptrace")
+        if os.path.isfile(helper):
+            zf.write(helper, "sms-ptrace")
 PY
 
 cat >"$tmp" <<SCRIPT
@@ -57,8 +67,9 @@ set -eu
 
 app_size=$app_size
 app_stamp=$app_stamp
-runtime_enabled=$runtime_enabled
 trace_helper_enabled=$trace_helper_enabled
+tls_runtime_enabled=$tls_runtime_enabled
+tls_library_name=$tls_library_name
 SCRIPT
 
 cat >>"$tmp" <<'SCRIPT'
@@ -93,20 +104,20 @@ rm -f "$trace_helper_tmp"
 
 runtime_ready()
 {
-	if [ "$runtime_enabled" = 0 ]; then
-		return 0
+	if [ "$tls_runtime_enabled" = 1 ] &&
+	   [ ! -f "$lib_out/$tls_library_name" ]; then
+		return 1
 	fi
-	[ -f "$lib_out/libmbedcrypto.so.0" ] &&
-	[ -f "$lib_out/libmbedx509.so.0" ] &&
-	[ -f "$lib_out/libmbedtls.so.10" ]
 	if [ "$trace_helper_enabled" = 1 ]; then
 		[ -x "$trace_helper_out" ]
+		return
 	fi
+	return 0
 }
 
 run_app()
 {
-	if [ "$runtime_enabled" = 1 ]; then
+	if [ "$tls_runtime_enabled" = 1 ]; then
 		if [ "$trace_helper_enabled" = 1 ]; then
 			ALICE_PUSHER_TRACE_HELPER="$trace_helper_out" \
 			LD_LIBRARY_PATH="$lib_out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -152,28 +163,33 @@ if [ ! -s "$zip" ]; then
 	exit 1
 fi
 
-if [ "$runtime_enabled" = 1 ]; then
+if [ "$tls_runtime_enabled" = 1 ]; then
 	mkdir -p "$lib_tmp"
-	if ! unzip -q "$zip" 'lib/*' -d "$lib_tmp"; then
+	if ! unzip -p "$zip" "lib/$tls_library_name" >"$lib_tmp/$tls_library_name"; then
 		rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
-		echo "runtime library extraction failed" >&2
+		echo "BearSSL runtime extraction failed" >&2
 		exit 1
 	fi
-	if [ ! -f "$lib_tmp/lib/libmbedcrypto.so.0" ] ||
-	   [ ! -f "$lib_tmp/lib/libmbedx509.so.0" ] ||
-	   [ ! -f "$lib_tmp/lib/libmbedtls.so.10" ]; then
+	if [ ! -s "$lib_tmp/$tls_library_name" ]; then
 		rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
-		echo "runtime libraries missing from payload" >&2
+		echo "BearSSL runtime missing from payload" >&2
 		exit 1
 	fi
-	if [ "$trace_helper_enabled" = 1 ]; then
-		if [ ! -f "$lib_tmp/lib/sms-ptrace" ]; then
-			rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
-			echo "sms-ptrace missing from payload" >&2
-			exit 1
-		fi
-		chmod 755 "$lib_tmp/lib/sms-ptrace"
+	chmod 755 "$lib_tmp/$tls_library_name"
+fi
+
+if [ "$trace_helper_enabled" = 1 ]; then
+	if ! unzip -p "$zip" sms-ptrace >"$trace_helper_tmp"; then
+		rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
+		echo "sms-ptrace extraction failed" >&2
+		exit 1
 	fi
+	if [ ! -s "$trace_helper_tmp" ]; then
+		rm -rf "$tmp" "$zip" "$lib_tmp" "$trace_helper_tmp"
+		echo "sms-ptrace missing from payload" >&2
+		exit 1
+	fi
+	chmod 755 "$trace_helper_tmp"
 fi
 
 if ! unzip -p "$zip" alice-pusher-bot >"$tmp"; then
@@ -191,13 +207,11 @@ fi
 
 chmod 755 "$tmp"
 mv "$tmp" "$out"
-if [ "$runtime_enabled" = 1 ]; then
+if [ "$tls_runtime_enabled" = 1 ]; then
 	rm -rf "$lib_out"
-	mv "$lib_tmp/lib" "$lib_out"
-	rmdir "$lib_tmp" 2>/dev/null || true
+	mv "$lib_tmp" "$lib_out"
 fi
 if [ "$trace_helper_enabled" = 1 ]; then
-	mv "$lib_out/sms-ptrace" "$trace_helper_tmp"
 	mv "$trace_helper_tmp" "$trace_helper_out"
 fi
 echo "$app_stamp" >"$stamp" 2>/dev/null || true

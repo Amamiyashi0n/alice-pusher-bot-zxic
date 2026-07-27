@@ -19,10 +19,11 @@
 
 ## 构建平台
 
-本项目推荐在以下平台进行编译和运行：
+本项目推荐在 Linux 上交叉编译，目标运行环境为 ARMv7/uClibc。构建需要：
 
-- **操作系统**：Ubuntu 14.04 LTS
-- **编译环境**：确保系统已安装 `g++`, `make`, `git` 等基础开发工具
+- 可运行的 `arm-linux-gnueabi-gcc`（GCC 9 或更新版本）和 `readelf`
+- 与设备 ABI 匹配的 Alice Buildroot 输出目录
+- Python 3
 
 ---
 
@@ -39,12 +40,23 @@
    sh ./make.sh
    ```
 
-   如果当前目录旁边存在 `../alice-buildroot/output-target`，脚本会自动使用其中与目标设备匹配的 ARM/uClibc 工具链。也可以显式指定 Buildroot 输出目录：
+   如果当前目录旁边存在 `../alice-buildroot/output-target`，脚本会自动使用其中与目标设备匹配的 ARM/uClibc sysroot。也可以显式指定 Buildroot 输出目录：
    ```bash
    ALICE_BUILDROOT_OUTPUT=/path/to/alice-buildroot/output-target sh ./make.sh
    ```
 
-3. 编译成功后，可执行文件将生成在当前目录或 `output/` 目录下（视 make.sh 脚本逻辑而定）。
+   编译器前端和 SDK 编译器也可以分别覆盖：
+   ```bash
+   CC=/path/to/arm-linux-gnueabi-gcc \
+   SDK_CC=/path/to/arm-buildroot-linux-uclibcgnueabi-gcc sh ./make.sh
+   ```
+
+3. 编译成功后生成主程序 `output/alice-pusher-bot`、私有动态库
+   `output/lib/libalice-bearssl.so.0` 和自解压的
+   `output/alice-pusher-bot.run`。直接运行裸主程序时需要指定库目录：
+   ```bash
+   LD_LIBRARY_PATH=output/lib output/alice-pusher-bot
+   ```
 
 ---
 
@@ -52,16 +64,20 @@
 
 - `src/webui.c`：WebUI、配置、自启动、服务管理和 CLI 入口。
 - `src/alice-pusher-bot.c`：PDU 解码、strace 跟踪、Webhook 和 SMTP 邮箱推送引擎核心。
+- `src/bearssl_transport.c`：Webhook 与 SMTP 共用的 TCP/BearSSL 传输层。
 - `src/alice-pusher-bot.h`：WebUI 调用引擎核心的公共接口。
+- `third_party/bearssl`：构建私有 TLS 动态库的 BearSSL 0.6 最小源码子集。
 - `tests/test_pdu.c`：不连接网络的 PDU 解码与长短信拼合测试。
+- `tests/run_tests.sh`：PDU、HTTPS、SMTP STARTTLS 和隐式 TLS 测试入口。
 
 ---
 
 ## 注意事项
 
 - 请确保您的系统环境满足依赖要求。
-- `.run` 会携带面向目标 ARMv7/uClibc 环境的轻量 `sms-ptrace`，只捕获 `read/write` 返回数据中的 `+CMT` 短信；短信采集不依赖设备预装完整 `strace`。
-- WebUI 支持最多 4 个推送目标；Webhook 和 SMTP 邮箱均可作为独立目标同时启用，每个目标使用独立的平台、地址和模板配置。邮箱使用目标设备已有的 mbedTLS，支持明文、STARTTLS 和隐式 TLS。
+- `.run` 会携带私有的 `libalice-bearssl.so.0` 和面向目标 ARMv7/uClibc 环境的轻量 `sms-ptrace`。启动器自动设置动态库目录；目标系统只需提供已有的 `libc.so.0`、`libpthread.so.0` 和 `libgcc_s.so.1`。
+- WebUI 支持最多 4 个推送目标；Webhook 和 SMTP 邮箱均可作为独立目标同时启用，每个目标使用独立的平台、地址和模板配置。邮箱支持明文、STARTTLS 和隐式 TLS。
+- HTTPS/SMTP TLS 使用 BearSSL，固定为 TLS 1.2、RSA 密钥交换和 AES-128-GCM/CBC。为保持原有行为，当前不校验证书链、主机名和有效期，连接可能受到中间人攻击。
 - WebUI 的“实验功能”页面默认启用长短信分段拼合，支持 UCS2、GSM 7-bit，以及 8 位和 16 位 UDH 引用号。分段支持乱序和重复到达，收齐后只推送一次。
 - 长短信拼合限制为最多 16 段、拼合后最多 4096 字节，缓存超时时间为 120 秒。超时、超限或不支持的编码只记录并丢弃，不发送不完整短信；关闭开关后恢复每个 PDU 独立推送。
 - 配置文件中的 `long_sms_reassembly=1` 或 `0` 控制该功能。通过 WebUI 保存时，如果短信监控服务正在运行，会自动重启服务使设置立即生效。

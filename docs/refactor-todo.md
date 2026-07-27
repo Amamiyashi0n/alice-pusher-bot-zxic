@@ -4,7 +4,7 @@
 
 - 将 `src/alice-sms-pusher.c` 重命名为 `src/webui.c`，作为 WebUI、配置、自启动、服务启停、HTTP 路由和 CLI 入口核心。
 - 将 `src/alice-pusher-bot.c` 作为 PDU/strace/推送引擎核心，不再包含 `main`。
-- 保持输出名称：继续输出 `output/alice-pusher-bot` 和带运行库的 `output/alice-pusher-bot.run`。
+- 保持输出名称：继续输出 `output/alice-pusher-bot` 和自解压的 `output/alice-pusher-bot.run`。
 
 ## TODO
 
@@ -50,16 +50,18 @@
 - [x] 链接阶段无重复符号，重点检查 `main`、`send_webhook_msg`、`decode_pdu`、`signal_handler`。
 - [x] `output/alice-pusher-bot` 无参数时显示 usage。
 - [x] `output/alice-pusher-bot --mode=send_once` 缺参数时显示 usage。
-- [x] 主程序动态链接 mbedTLS，`.run` 自带并提取三个 mbedTLS 运行库。
-- [x] Webhook 仅启用 TLS1.2 RSA/AES-128 最小 cipher suite，关闭 CA/证书信任校验。
+- [x] Webhook 与 SMTP 共用私有的 `libalice-bearssl.so.0`，BearSSL 内部符号不对外导出。
+- [x] `.run` 自带并提取私有 TLS 动态库，裸二进制通过 `LD_LIBRARY_PATH=output/lib` 运行。
+- [x] TLS 仅启用 TLS 1.2、RSA/AES-128-GCM/CBC 最小 cipher suite，关闭 CA、主机名和有效期校验。
+- [x] 本地测试覆盖 Webhook、SMTP STARTTLS、SMTP 隐式 TLS 及 GCM/CBC 套件。
 - [x] WebUI 的启动、停止、重启、测试发送路径都调用引擎 API。
 - [x] 自启动安装/卸载复用 Wonder 用户态入口，并提供 Wonder 检测、模式、脚本和运行状态。
 - [x] Pushbot 持久化安装空间不足时显示明确的需要空间与可用空间。
 
-> 说明：构建产物是 ARM/uClibc 动态二进制；直接运行裸二进制时需要同时提供 `output/lib` 并设置 `LD_LIBRARY_PATH`，推荐使用自带运行库的 `.run` 包。
+> 说明：主程序动态依赖私有 TLS 库以及设备的 `libc.so.0`、`libpthread.so.0`、`libgcc_s.so.1`；`.run` 携带私有 TLS 库和短信采集 helper。
 
 ## 已确定方案
 
-- 采用动态主程序加自带运行库的 `.run` 交付方案。
+- 采用动态主程序加自带私有 TLS 库、短信采集 helper 的 `.run` 交付方案。
 - 保留 WebUI 当前已有的全部推送平台和自定义模板能力。
 - WebUI 与引擎在同一二进制内通过 C 函数接口协作，不引入新的进程间协议。

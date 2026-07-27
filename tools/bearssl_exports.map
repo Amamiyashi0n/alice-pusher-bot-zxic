@@ -1,0 +1,13 @@
+{
+    global:
+        alice_transport_init;
+        alice_transport_connect;
+        alice_transport_start_tls;
+        alice_transport_write_all;
+        alice_transport_read;
+        alice_transport_tls_error;
+        alice_transport_is_tls;
+        alice_transport_close;
+    local:
+        *;
+};

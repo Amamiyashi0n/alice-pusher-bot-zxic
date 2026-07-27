@@ -6,13 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <mbedtls/net.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/ssl_ciphersuites.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/version.h>
 #include "alice-pusher-bot.h"
+#include "bearssl_transport.h"
 #include <pthread.h>
 #include <signal.h>
 #include <errno.h>
@@ -40,21 +35,16 @@
 
 static char g_target_path[256] = TARGET_MIFI_PATH;
 
-static const int g_webhook_ciphersuites[] = {
-    MBEDTLS_TLS_RSA_WITH_AES_128_CBC_SHA256,
-    MBEDTLS_TLS_RSA_WITH_AES_128_CBC_SHA,
-    0
-};
-
-
 // 函数声明
 static pid_t get_strace_pid_from_file(void);
 static void set_strace_pid_to_file(pid_t pid);
 int alice_engine_send_webhook_msg(const char *webhook, const char *platform,
                                     const char *txt, const char *custom_ctype,
                                     const char *custom_body);
-static void print_mbedtls_error(int ret, const char *msg);
-static void parse_url(const char *url, char **host, char **path);
+static void print_tls_error(const alice_transport_t *transport,
+                            const char *operation);
+static int parse_https_url(const char *url, char **host, char **port,
+                           char **path);
 static void engine_signal_handler(int sig);
 static int find_process_by_exe_path(const char *exe_path);
 static void sigcont_process_by_path(const char *exe_path);
@@ -1639,24 +1629,20 @@ cleanup:
 
 static int post_https_body(const char *webhook, const char *ctype,
                            const char *payload, const char *platform) {
-    char *host = NULL, *path = NULL;
+    char *host = NULL;
+    char *port = NULL;
+    char *path = NULL;
     const char *request_path;
     char *request_buffer = NULL;
     unsigned char read_buf[1024];
     int request_len;
     size_t request_cap;
-    int ret = 0;
+    int ret;
     int rc = -1;
-    const char *port = "443";
-    const char *pers = "ssl_client";
-    mbedtls_net_context server_fd;
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
+    alice_transport_t transport;
 
-    parse_url(webhook, &host, &path);
-    if (!host || !path) {
+    alice_transport_init(&transport);
+    if (parse_https_url(webhook, &host, &port, &path) < 0) {
         engine_log("[WEBHOOK] invalid url");
         goto cleanup_strings;
     }
@@ -1664,48 +1650,19 @@ static int post_https_body(const char *webhook, const char *ctype,
     if (platform && strcmp(platform, "bark") == 0)
         request_path = "/push";
 
-    mbedtls_net_init(&server_fd);
-    mbedtls_ssl_init(&ssl);
-    mbedtls_ssl_config_init(&conf);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
-                                     &entropy, (const unsigned char *)pers,
-                                     strlen(pers))) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ctr_drbg_seed");
+    if (alice_transport_connect(&transport, host, port, 15) < 0) {
+        engine_log("[WEBHOOK] connect failed host=%s port=%s: %s",
+                   host, port, strerror(errno));
         goto cleanup_tls;
     }
-    if ((ret = mbedtls_net_connect(&server_fd, host, port,
-                                   MBEDTLS_NET_PROTO_TCP)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_net_connect");
+    if (alice_transport_start_tls(&transport, host) < 0) {
+        engine_log("[WEBHOOK] TLS setup failed host=%s: %s",
+                   host, strerror(errno));
         goto cleanup_tls;
-    }
-    if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
-                                           MBEDTLS_SSL_TRANSPORT_STREAM,
-                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_config_defaults");
-        goto cleanup_tls;
-    }
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_ciphersuites(&conf, g_webhook_ciphersuites);
-    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-    if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
-        print_mbedtls_error(ret, "mbedtls_ssl_setup");
-        goto cleanup_tls;
-    }
-    mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send,
-                        mbedtls_net_recv, NULL);
-    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "mbedtls_ssl_handshake");
-            goto cleanup_tls;
-        }
     }
 
-    request_cap = strlen(payload) + strlen(host) + strlen(request_path) +
-                  strlen(ctype) + 512;
+    request_cap = strlen(payload) + strlen(host) + strlen(port) +
+                  strlen(request_path) + strlen(ctype) + 512;
     request_buffer = (char *)malloc(request_cap);
     if (!request_buffer) {
         engine_log("[WEBHOOK] request buffer allocation failed");
@@ -1713,14 +1670,16 @@ static int post_https_body(const char *webhook, const char *ctype,
     }
     request_len = snprintf(request_buffer, request_cap,
         "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
+        "Host: %s%s%s\r\n"
         "User-Agent: alice-pusher-bot/1.0\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n"
         "%s",
-        request_path, host, ctype, strlen(payload), payload);
+        request_path, host, strcmp(port, "443") == 0 ? "" : ":",
+        strcmp(port, "443") == 0 ? "" : port,
+        ctype, strlen(payload), payload);
     if (request_len <= 0 || (size_t)request_len >= request_cap) {
         engine_log("[WEBHOOK] request too large");
         goto cleanup_tls;
@@ -1728,76 +1687,49 @@ static int post_https_body(const char *webhook, const char *ctype,
 
     engine_log("[WEBHOOK] platform=%s host=%s bytes=%zu",
                platform ? platform : "dingtalk", host, strlen(payload));
-    while ((ret = mbedtls_ssl_write(&ssl,
-                                    (const unsigned char *)request_buffer,
-                                    (size_t)request_len)) <= 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "mbedtls_ssl_write");
-            goto cleanup_tls;
-        }
+    if (alice_transport_write_all(&transport, request_buffer,
+                                  (size_t)request_len) < 0) {
+        print_tls_error(&transport, "webhook write");
+        goto cleanup_tls;
     }
 
     memset(read_buf, 0, sizeof(read_buf));
-    ret = mbedtls_ssl_read(&ssl, read_buf, sizeof(read_buf) - 1);
+    ret = alice_transport_read(&transport, read_buf, sizeof(read_buf) - 1);
     if (ret > 0)
         engine_log("[WEBHOOK] response: %s", read_buf);
-    else if (ret < 0 &&
-             ret != MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY &&
-             ret != MBEDTLS_ERR_SSL_WANT_READ)
-        print_mbedtls_error(ret, "mbedtls_ssl_read");
+    else if (ret < 0 && alice_transport_tls_error(&transport) != 0)
+        print_tls_error(&transport, "webhook read");
     rc = 0;
 
 cleanup_tls:
     free(request_buffer);
-    mbedtls_net_free(&server_fd);
-    mbedtls_ssl_free(&ssl);
-    mbedtls_ssl_config_free(&conf);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
+    alice_transport_close(&transport);
 cleanup_strings:
-    if (host) free(host);
-    if (path) free(path);
+    free(host);
+    free(port);
+    free(path);
     return rc;
 }
 
 typedef struct {
-    mbedtls_net_context net;
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    int tls_active;
+    alice_transport_t transport;
 } smtp_conn_t;
 
 static int smtp_conn_write(smtp_conn_t *conn, const unsigned char *buf,
                            size_t len) {
-    size_t sent = 0;
-
-    while (sent < len) {
-        int ret = conn->tls_active ?
-            mbedtls_ssl_write(&conn->ssl, buf + sent, len - sent) :
-            mbedtls_net_send(&conn->net, buf + sent, len - sent);
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
-            ret == MBEDTLS_ERR_SSL_WANT_WRITE)
-            continue;
-        if (ret <= 0)
-            return -1;
-        sent += (size_t)ret;
+    if (alice_transport_write_all(&conn->transport, buf, len) < 0) {
+        if (alice_transport_is_tls(&conn->transport))
+            print_tls_error(&conn->transport, "SMTP write");
+        return -1;
     }
     return 0;
 }
 
 static int smtp_conn_read(smtp_conn_t *conn, unsigned char *buf, size_t len) {
-    for (;;) {
-        int ret = conn->tls_active ?
-            mbedtls_ssl_read(&conn->ssl, buf, len) :
-            mbedtls_net_recv(&conn->net, buf, len);
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
-            ret == MBEDTLS_ERR_SSL_WANT_WRITE)
-            continue;
-        return ret;
-    }
+    int ret = alice_transport_read(&conn->transport, buf, len);
+    if (ret < 0 && alice_transport_is_tls(&conn->transport))
+        print_tls_error(&conn->transport, "SMTP read");
+    return ret;
 }
 
 static int smtp_send_text(smtp_conn_t *conn, const char *text) {
@@ -1887,45 +1819,10 @@ static int smtp_base64_encode(const unsigned char *src, size_t src_len,
 }
 
 static int smtp_enable_tls(smtp_conn_t *conn, const char *host) {
-    int ret;
-    const char *pers = "alice-pusher-smtp";
-
-    if ((ret = mbedtls_ctr_drbg_seed(&conn->ctr_drbg,
-                                     mbedtls_entropy_func,
-                                     &conn->entropy,
-                                     (const unsigned char *)pers,
-                                     strlen(pers))) != 0) {
-        print_mbedtls_error(ret, "smtp ctr_drbg_seed");
+    if (alice_transport_start_tls(&conn->transport, host) < 0) {
+        engine_log("[SMTP] TLS setup failed: %s", strerror(errno));
         return -1;
     }
-    if ((ret = mbedtls_ssl_config_defaults(&conn->conf,
-                                           MBEDTLS_SSL_IS_CLIENT,
-                                           MBEDTLS_SSL_TRANSPORT_STREAM,
-                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
-        print_mbedtls_error(ret, "smtp ssl_config_defaults");
-        return -1;
-    }
-    mbedtls_ssl_conf_authmode(&conn->conf, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_rng(&conn->conf, mbedtls_ctr_drbg_random,
-                         &conn->ctr_drbg);
-    if ((ret = mbedtls_ssl_setup(&conn->ssl, &conn->conf)) != 0) {
-        print_mbedtls_error(ret, "smtp ssl_setup");
-        return -1;
-    }
-    if (host && host[0] && mbedtls_ssl_set_hostname(&conn->ssl, host) != 0) {
-        engine_log("[SMTP] invalid server hostname");
-        return -1;
-    }
-    mbedtls_ssl_set_bio(&conn->ssl, &conn->net, mbedtls_net_send,
-                        mbedtls_net_recv, NULL);
-    while ((ret = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            print_mbedtls_error(ret, "smtp ssl_handshake");
-            return -1;
-        }
-    }
-    conn->tls_active = 1;
     return 0;
 }
 
@@ -2038,13 +1935,8 @@ static int smtp_send_message(const char *host, const char *port,
     }
 
     memset(&conn, 0, sizeof(conn));
-    mbedtls_net_init(&conn.net);
-    mbedtls_ssl_init(&conn.ssl);
-    mbedtls_ssl_config_init(&conn.conf);
-    mbedtls_entropy_init(&conn.entropy);
-    mbedtls_ctr_drbg_init(&conn.ctr_drbg);
-    if (mbedtls_net_connect(&conn.net, host, connect_port,
-                            MBEDTLS_NET_PROTO_TCP) != 0) {
+    alice_transport_init(&conn.transport);
+    if (alice_transport_connect(&conn.transport, host, connect_port, 15) < 0) {
         engine_log("[SMTP] connect failed host=%s port=%s", host, connect_port);
         goto cleanup;
     }
@@ -2105,13 +1997,7 @@ static int smtp_send_message(const char *host, const char *port,
 
 cleanup:
     free(data);
-    if (conn.tls_active)
-        mbedtls_ssl_close_notify(&conn.ssl);
-    mbedtls_net_free(&conn.net);
-    mbedtls_ssl_free(&conn.ssl);
-    mbedtls_ssl_config_free(&conn.conf);
-    mbedtls_ctr_drbg_free(&conn.ctr_drbg);
-    mbedtls_entropy_free(&conn.entropy);
+    alice_transport_close(&conn.transport);
     return rc;
 }
 
@@ -2307,34 +2193,119 @@ static void process_strace_line_for_sms(
     }
 }
 
-// 打印 mbedtls 错误码的帮助函数
-static void print_mbedtls_error(int ret, const char *msg) {
-    engine_log("[TLS] %s failed: -0x%x", msg, -ret);
+static void print_tls_error(const alice_transport_t *transport,
+                            const char *operation) {
+    int error = alice_transport_tls_error(transport);
+    if (error)
+        engine_log("[TLS] %s failed: BearSSL error=%d", operation, error);
+    else
+        engine_log("[TLS] %s failed: %s", operation, strerror(errno));
 }
 
-// 从 URL 中提取主机名和路径
-static void parse_url(const char *url, char **host, char **path) {
-    char *start;
-    char *end;
+static int parse_https_url(const char *url, char **host, char **port,
+                           char **path) {
+    const char *start;
+    const char *authority_end;
+    const char *host_end;
+    const char *port_start = NULL;
+    const char *colon;
+    const char *path_end;
+    size_t host_len;
+    size_t port_len;
+    size_t path_len;
+    unsigned long port_number = 0;
+    size_t i;
 
-    if (strstr(url, "https://") == url) {
-        start = (char *)url + strlen("https://");
+    if (!host || !port || !path)
+        return -1;
+    *host = NULL;
+    *port = NULL;
+    *path = NULL;
+    if (!url || strncmp(url, "https://", 8) != 0)
+        return -1;
+
+    start = url + 8;
+    authority_end = strpbrk(start, "/?#");
+    if (!authority_end)
+        authority_end = start + strlen(start);
+    if (authority_end == start || memchr(start, '@', authority_end - start))
+        return -1;
+
+    colon = (const char *)memchr(start, ':', authority_end - start);
+    if (colon) {
+        if (memchr(colon + 1, ':', authority_end - colon - 1))
+            return -1;
+        host_end = colon;
+        port_start = colon + 1;
     } else {
-        *host = NULL;
-        *path = NULL;
-        return;
+        host_end = authority_end;
+    }
+    host_len = (size_t)(host_end - start);
+    if (!host_len)
+        return -1;
+
+    if (port_start) {
+        port_len = (size_t)(authority_end - port_start);
+        if (!port_len || port_len > 5)
+            return -1;
+        for (i = 0; i < port_len; i++) {
+            unsigned char ch = (unsigned char)port_start[i];
+            if (!isdigit(ch))
+                return -1;
+            port_number = port_number * 10 + (unsigned long)(ch - '0');
+        }
+        if (!port_number || port_number > 65535)
+            return -1;
+    } else {
+        port_start = "443";
+        port_len = 3;
     }
 
-    end = strchr(start, '/');
-    if (end) {
-        *host = (char *)malloc(end - start + 1);
-        strncpy(*host, start, end - start);
-        (*host)[end - start] = '\0';
-        *path = strdup(end);
+    *host = (char *)malloc(host_len + 1);
+    *port = (char *)malloc(port_len + 1);
+    if (!*host || !*port)
+        goto error;
+    memcpy(*host, start, host_len);
+    (*host)[host_len] = 0;
+    memcpy(*port, port_start, port_len);
+    (*port)[port_len] = 0;
+
+    if (*authority_end == '/') {
+        path_end = strchr(authority_end, '#');
+        if (!path_end)
+            path_end = authority_end + strlen(authority_end);
+        path_len = (size_t)(path_end - authority_end);
+        *path = (char *)malloc(path_len + 1);
+        if (!*path)
+            goto error;
+        memcpy(*path, authority_end, path_len);
+        (*path)[path_len] = 0;
+    } else if (*authority_end == '?') {
+        path_end = strchr(authority_end, '#');
+        if (!path_end)
+            path_end = authority_end + strlen(authority_end);
+        path_len = (size_t)(path_end - authority_end);
+        *path = (char *)malloc(path_len + 2);
+        if (!*path)
+            goto error;
+        (*path)[0] = '/';
+        memcpy(*path + 1, authority_end, path_len);
+        (*path)[path_len + 1] = 0;
     } else {
-        *host = strdup(start);
         *path = strdup("/");
+        if (!*path)
+            goto error;
     }
+    return 0;
+
+error:
+    free(*host);
+    free(*port);
+    free(*path);
+    *host = NULL;
+    *port = NULL;
+    *path = NULL;
+    return -1;
 }
 
 // 信号处理函数，用于优雅关闭线程
