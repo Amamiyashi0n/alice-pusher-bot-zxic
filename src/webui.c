@@ -27,13 +27,6 @@
 #define DEFAULT_LOG_PATH "/tmp/alice_pusher.log"
 #define DEFAULT_LOG_LOCK_PATH "/tmp/alice_pusher.log.lock"
 #define USERDATA_DIR "/mnt/userdata"
-#define WONDER_DIR USERDATA_DIR "/alice_rescue"
-#define WONDER_RUN_PATH WONDER_DIR "/alice-rc.run"
-#define WONDER_MANIFEST_PATH WONDER_DIR "/manifest"
-#define WONDER_GLOBAL_PATH WONDER_DIR "/global.sh"
-#define WONDER_AUTOSTART_MAIN USERDATA_DIR "/alice_wonder_autostart.sh"
-#define WONDER_SYSTEM_STARTUP WONDER_DIR "/system_startup.sh"
-#define WONDER_PUSHER_SCRIPT WONDER_DIR "/autostart/alice-pusher-bot.sh"
 #define PUSHER_DIR USERDATA_DIR "/alice_pusher"
 #define PUSHER_RUN_PATH PUSHER_DIR "/alice-pusher-bot.run"
 #define PUSHER_BIN_PATH PUSHER_DIR "/alice-pusher-bot"
@@ -41,15 +34,24 @@
 #define PUSHER_MANIFEST_PATH PUSHER_DIR "/manifest"
 #define PUSHER_START_LOG "/tmp/alice_pusher_autostart.out"
 #define PUSHER_START_MARKER "/tmp/alice_pusher_autostart.started"
-#define PUSHER_PATH_SH_MARKER "/tmp/alice_pusher_path_sh_started"
 #define PUSHER_AUTOSTART_BEGIN "# alice-pusher-bot path_sh begin"
 #define PUSHER_AUTOSTART_END "# alice-pusher-bot path_sh end"
+#ifndef PUSHER_RC_PATH
+#define PUSHER_RC_PATH "/etc/rc"
+#endif
+#define PUSHER_RC_BEGIN "# alice-pusher-bot rc begin"
+#define PUSHER_RC_END "# alice-pusher-bot rc end"
+#define PUSHER_RC_MAX_BYTES (256UL * 1024UL)
+#ifndef PROC_MOUNTS_PATH
+#define PROC_MOUNTS_PATH "/proc/mounts"
+#endif
 #define DELIVERY_WEBHOOK "webhook"
 #define DELIVERY_EMAIL "email"
 #define TARGET_TYPE_WEBHOOK "webhook"
 #define TARGET_TYPE_EMAIL "email"
 #define TARGET_NAME_MAX 64
 #define PERSIST_RESERVE_BYTES (16UL * 1024UL)
+#define LEGACY_INTEGRATED_STARTUP USERDATA_DIR "/alice_rescue/autostart/alice-pusher-bot.sh"
 #define LEGACY_RUN_PATH USERDATA_DIR "/alice-pusher-bot.run"
 #define LEGACY_BIN_PATH USERDATA_DIR "/alice-pusher-bot"
 #define LEGACY_AUTOSTART_SCRIPT USERDATA_DIR "/alice_pusher_autostart.sh"
@@ -117,7 +119,6 @@ typedef struct {
 } web_config_t;
 
 typedef struct {
-    int wonder_detected;
     int payload_ready;
     int script_ready;
     int entry_ready;
@@ -131,6 +132,19 @@ typedef struct {
     char script_path[256];
     char error[256];
 } autostart_status_t;
+
+typedef struct {
+    char source[256];
+    char target[256];
+    int was_readonly;
+    int remounted;
+} rc_mount_info_t;
+
+enum {
+    PERSIST_NONE = 0,
+    PERSIST_NV = 1,
+    PERSIST_RC = 2
+};
 
 static char g_autostart_error[256];
 
@@ -739,12 +753,6 @@ static void remount_userdata_rw(void) {
            "mount -o remount,rw " USERDATA_DIR " 2>/dev/null");
 }
 
-enum {
-    PERSIST_NONE = 0,
-    PERSIST_WONDER = 1,
-    PERSIST_STANDALONE = 2
-};
-
 static void set_autostart_error(const char *fmt, ...) {
     va_list ap;
 
@@ -753,59 +761,175 @@ static void set_autostart_error(const char *fmt, ...) {
     va_end(ap);
 }
 
-static int read_nv_path_sh(char *out, size_t outsz) {
-    FILE *fp;
-    size_t len;
+static const char *nv_binary_path(void) {
+#ifdef NV_BINARY_PATH_OVERRIDE
+    if (access(NV_BINARY_PATH_OVERRIDE, X_OK) == 0)
+        return NV_BINARY_PATH_OVERRIDE;
+    errno = ENOENT;
+    return NULL;
+#else
+    static const char *const candidates[] = {
+        "/bin/nv", "/sbin/nv", "/usr/bin/nv", "/usr/sbin/nv", NULL
+    };
+    int i;
 
-    if (!out || outsz == 0) return -1;
-    out[0] = 0;
-    fp = popen("nv get path_sh 2>/dev/null", "r");
-    if (!fp) return -1;
-    if (!fgets(out, (int)outsz, fp)) {
-        pclose(fp);
+    for (i = 0; candidates[i]; i++) {
+        if (access(candidates[i], X_OK) == 0)
+            return candidates[i];
+    }
+    errno = ENOENT;
+    return NULL;
+#endif
+}
+
+static int wait_command_child(pid_t pid) {
+    int status;
+    pid_t result;
+
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0)
+        return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        errno = EIO;
         return -1;
     }
-    pclose(fp);
-    len = strcspn(out, "\r\n \t");
-    out[len] = 0;
-    return out[0] ? 0 : -1;
+    return 0;
 }
 
-static int wonder_deployed(void) {
-    char path_sh[256];
+static int run_nv_quiet(const char *operation, const char *argument) {
+    const char *nv = nv_binary_path();
+    pid_t pid;
 
-    if (read_nv_path_sh(path_sh, sizeof(path_sh)) < 0 ||
-        strcmp(path_sh, WONDER_DIR) != 0)
-        return 0;
-    return access(WONDER_DIR, X_OK) == 0 &&
-           path_is_regular_readable(WONDER_RUN_PATH) &&
-           path_is_regular_readable(WONDER_GLOBAL_PATH) &&
-           path_is_regular_readable(WONDER_AUTOSTART_MAIN) &&
-           path_is_regular_readable(WONDER_SYSTEM_STARTUP) &&
-           file_contains(WONDER_MANIFEST_PATH, "name=alice-wonder") &&
-           file_contains(WONDER_GLOBAL_PATH, "alice-wonder path_sh begin");
+    if (!nv) return -1;
+    pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_WRONLY);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            if (nullfd > STDERR_FILENO) close(nullfd);
+        }
+        if (argument)
+            execl(nv, "nv", operation, argument, (char *)NULL);
+        else
+            execl(nv, "nv", operation, (char *)NULL);
+        _exit(127);
+    }
+    return wait_command_child(pid);
 }
 
-static int standalone_entry_ready(void) {
-    char path_sh[256];
+static int read_nv_path_sh(char *out, size_t outsz) {
+    const char *nv = nv_binary_path();
+    char chunk[128];
+    size_t used = 0;
+    int pipefd[2];
+    int read_error = 0;
+    pid_t pid;
 
-    if (read_nv_path_sh(path_sh, sizeof(path_sh)) < 0 ||
-        strcmp(path_sh, PUSHER_DIR) != 0)
-        return 0;
+    if (!out || outsz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    out[0] = 0;
+    if (!nv || pipe(pipefd) < 0) return -1;
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        int nullfd;
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        if (pipefd[1] != STDOUT_FILENO) close(pipefd[1]);
+        nullfd = open("/dev/null", O_WRONLY);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDERR_FILENO);
+            if (nullfd > STDERR_FILENO) close(nullfd);
+        }
+        execl(nv, "nv", "get", "path_sh", (char *)NULL);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    for (;;) {
+        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+        size_t copy_len;
+
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            read_error = errno;
+            break;
+        }
+        if (n == 0) break;
+        copy_len = (size_t)n;
+        if (copy_len > outsz - 1 - used)
+            copy_len = outsz - 1 - used;
+        if (copy_len) {
+            memcpy(out + used, chunk, copy_len);
+            used += copy_len;
+        }
+    }
+    close(pipefd[0]);
+    out[used] = 0;
+    if (wait_command_child(pid) < 0) return -1;
+    if (read_error) {
+        errno = read_error;
+        return -1;
+    }
+    out[strcspn(out, "\r\n \t")] = 0;
+    if (!out[0]) {
+        errno = ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+static int set_nv_path_sh(const char *path) {
+    char assignment[320];
+    char verify[256];
+
+    if (!path || snprintf(assignment, sizeof(assignment), "path_sh=%s", path) >=
+                 (int)sizeof(assignment)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (run_nv_quiet("set", assignment) < 0 ||
+        run_nv_quiet("save", NULL) < 0)
+        return -1;
+    if (read_nv_path_sh(verify, sizeof(verify)) < 0 || strcmp(verify, path) != 0) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int nv_script_ready(void) {
     return path_is_regular_readable(PUSHER_GLOBAL_PATH) &&
            file_contains(PUSHER_GLOBAL_PATH, PUSHER_AUTOSTART_BEGIN) &&
            file_contains(PUSHER_GLOBAL_PATH, ". /sbin/global.sh");
 }
 
-static int persistence_mode(void) {
-    if (wonder_deployed()) return PERSIST_WONDER;
-    if (standalone_entry_ready()) return PERSIST_STANDALONE;
-    return PERSIST_NONE;
+static int nv_entry_ready(void) {
+    char path_sh[256];
+
+    return read_nv_path_sh(path_sh, sizeof(path_sh)) == 0 &&
+           strcmp(path_sh, PUSHER_DIR) == 0 && nv_script_ready();
+}
+
+static int rc_hook_ready(void) {
+    return path_is_regular_readable(PUSHER_RC_PATH) &&
+           file_contains(PUSHER_RC_PATH, PUSHER_RC_BEGIN) &&
+           file_contains(PUSHER_RC_PATH, PUSHER_RC_END) &&
+           file_contains(PUSHER_RC_PATH, PUSHER_RUN_PATH);
 }
 
 static const char *persistence_mode_label(int mode) {
-    if (mode == PERSIST_WONDER) return "Wonder 集成模式";
-    if (mode == PERSIST_STANDALONE) return "独立 path_sh 模式";
+    if (mode == PERSIST_NV) return "NV path_sh 模式";
+    if (mode == PERSIST_RC) return "/etc/rc 回退模式";
     return "未安装";
 }
 
@@ -898,6 +1022,295 @@ out:
     return rc;
 }
 
+static int mount_option_present(const char *options, const char *wanted) {
+    const char *p = options;
+    size_t wanted_len = strlen(wanted);
+
+    while (p && *p) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == wanted_len && strncmp(p, wanted, len) == 0)
+            return 1;
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+static int path_uses_mount(const char *path, const char *mountpoint) {
+    size_t len;
+
+    if (!path || !mountpoint || mountpoint[0] != '/') return 0;
+    if (strcmp(mountpoint, "/") == 0) return 1;
+    len = strlen(mountpoint);
+    return strncmp(path, mountpoint, len) == 0 &&
+           (path[len] == 0 || path[len] == '/');
+}
+
+static int find_rc_mount(rc_mount_info_t *info) {
+    FILE *fp;
+    char line[1024];
+    size_t best_len = 0;
+    int best_is_pseudo = 1;
+    int found = 0;
+
+    if (!info) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(info, 0, sizeof(*info));
+    fp = fopen(PROC_MOUNTS_PATH, "r");
+    if (!fp) return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        char source[256], target[256], fstype[64], options[512];
+        size_t target_len;
+        int is_pseudo;
+
+        if (sscanf(line, "%255s %255s %63s %511s",
+                   source, target, fstype, options) != 4)
+            continue;
+        if (!path_uses_mount(PUSHER_RC_PATH, target))
+            continue;
+        target_len = strlen(target);
+        is_pseudo = strcmp(source, "rootfs") == 0 ||
+                    strcmp(fstype, "rootfs") == 0;
+        if (found && (target_len < best_len ||
+            (target_len == best_len && !best_is_pseudo && is_pseudo)))
+            continue;
+        safe_copy(info->source, sizeof(info->source), source);
+        safe_copy(info->target, sizeof(info->target), target);
+        info->was_readonly = mount_option_present(options, "ro");
+        best_len = target_len;
+        best_is_pseudo = is_pseudo;
+        found = 1;
+    }
+    fclose(fp);
+    if (!found) {
+        errno = ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+static const char *mount_binary_path(void) {
+    if (access("/bin/mount", X_OK) == 0) return "/bin/mount";
+    if (access("/sbin/mount", X_OK) == 0) return "/sbin/mount";
+    errno = ENOENT;
+    return NULL;
+}
+
+static int run_mount_remount_once(const rc_mount_info_t *info,
+                                  int readonly, int include_source) {
+    const char *mount_bin = mount_binary_path();
+    const char *options = readonly ? "remount,ro" : "remount,rw";
+    pid_t pid;
+
+    if (!mount_bin) return -1;
+    pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_WRONLY);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            if (nullfd > STDERR_FILENO) close(nullfd);
+        }
+        if (include_source)
+            execl(mount_bin, "mount", "-o", options,
+                  info->source, info->target, (char *)NULL);
+        else
+            execl(mount_bin, "mount", "-o", options,
+                  info->target, (char *)NULL);
+        _exit(127);
+    }
+    return wait_command_child(pid);
+}
+
+static int run_mount_remount(const rc_mount_info_t *info, int readonly) {
+    if (run_mount_remount_once(info, readonly, 1) == 0)
+        return 0;
+    return run_mount_remount_once(info, readonly, 0);
+}
+
+static int begin_rc_write(rc_mount_info_t *info) {
+    rc_mount_info_t verify;
+
+    if (find_rc_mount(info) < 0) return -1;
+    if (!info->was_readonly) return 0;
+    if (run_mount_remount(info, 0) < 0) return -1;
+    info->remounted = 1;
+    if (find_rc_mount(&verify) < 0 || verify.was_readonly) {
+        int saved_errno = EROFS;
+        run_mount_remount(info, 1);
+        info->remounted = 0;
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int finish_rc_write(rc_mount_info_t *info) {
+    rc_mount_info_t verify;
+
+    if (!info || !info->remounted) return 0;
+    if (run_mount_remount(info, 1) < 0) return -1;
+    info->remounted = 0;
+    if (find_rc_mount(&verify) < 0 || !verify.was_readonly) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int replace_rc_file(const char *data, size_t len,
+                           const struct stat *original) {
+    char tmp[PATH_MAX];
+    int fd = -1;
+    int saved_errno;
+    int rc = -1;
+
+    if (snprintf(tmp, sizeof(tmp), "%s.alice_pusher_tmp.%ld",
+                 PUSHER_RC_PATH, (long)getpid()) >= (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    if (write_all_fd(fd, data, len) < 0 || fsync(fd) < 0)
+        goto out;
+    if (fchown(fd, original->st_uid, original->st_gid) < 0 ||
+        fchmod(fd, original->st_mode & 07777) < 0)
+        goto out;
+    if (close(fd) < 0) {
+        fd = -1;
+        goto out;
+    }
+    fd = -1;
+    if (rename(tmp, PUSHER_RC_PATH) < 0)
+        goto out;
+    sync();
+    rc = 0;
+
+out:
+    saved_errno = errno;
+    if (fd >= 0) close(fd);
+    if (rc < 0) unlink(tmp);
+    errno = saved_errno;
+    return rc;
+}
+
+static int rewrite_rc_hook(int install, int port) {
+    static const char hook_format[] =
+        "%s\n"
+        "if mkdir '%s' 2>/dev/null; then\n"
+        "    if [ -r '%s' ]; then\n"
+        "        ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh '%s' -w -L %d >> '%s' 2>&1 &\n"
+        "    elif [ -x '%s' ]; then\n"
+        "        ALICE_PUSHER_AUTOSTART=1 '%s' -w -L %d >> '%s' 2>&1 &\n"
+        "    else\n"
+        "        rmdir '%s' 2>/dev/null || true\n"
+        "    fi\n"
+        "fi\n"
+        "%s\n";
+    struct stat st;
+    rc_mount_info_t mount_info;
+    char hook[2048];
+    char *old_data = NULL;
+    char *new_data = NULL;
+    char *begin;
+    char *end;
+    char *suffix;
+    size_t old_len = 0;
+    size_t prefix_len;
+    size_t suffix_len;
+    size_t used;
+    int hook_len = 0;
+    int write_rc = -1;
+    int write_errno = 0;
+    int restore_rc;
+
+    if (lstat(PUSHER_RC_PATH, &st) < 0) {
+        if (!install && errno == ENOENT) return 0;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    old_data = read_file_alloc(PUSHER_RC_PATH, PUSHER_RC_MAX_BYTES, &old_len);
+    if (!old_data) return -1;
+    begin = strstr(old_data, PUSHER_RC_BEGIN);
+    end = begin ? strstr(begin, PUSHER_RC_END) : NULL;
+    if ((!begin && strstr(old_data, PUSHER_RC_END)) || (begin && !end)) {
+        free(old_data);
+        errno = EINVAL;
+        return -1;
+    }
+    if (!install && !begin) {
+        free(old_data);
+        return 0;
+    }
+    suffix = old_data + old_len;
+    if (end) {
+        char *next_begin;
+        end += strlen(PUSHER_RC_END);
+        next_begin = strstr(end, PUSHER_RC_BEGIN);
+        if (next_begin || strstr(end, PUSHER_RC_END)) {
+            free(old_data);
+            errno = EINVAL;
+            return -1;
+        }
+        if (*end == '\r') end++;
+        if (*end == '\n') end++;
+        suffix = end;
+    }
+    prefix_len = begin ? (size_t)(begin - old_data) : old_len;
+    suffix_len = (size_t)((old_data + old_len) - suffix);
+    if (install) {
+        hook_len = snprintf(hook, sizeof(hook), hook_format,
+            PUSHER_RC_BEGIN, PUSHER_START_MARKER,
+            PUSHER_RUN_PATH, PUSHER_RUN_PATH, port, PUSHER_START_LOG,
+            PUSHER_BIN_PATH, PUSHER_BIN_PATH, port, PUSHER_START_LOG,
+            PUSHER_START_MARKER, PUSHER_RC_END);
+        if (hook_len < 0 || hook_len >= (int)sizeof(hook)) {
+            free(old_data);
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+    new_data = malloc(prefix_len + suffix_len + (size_t)hook_len + 3);
+    if (!new_data) {
+        free(old_data);
+        return -1;
+    }
+    memcpy(new_data, old_data, prefix_len);
+    used = prefix_len;
+    if (suffix_len) {
+        memcpy(new_data + used, suffix, suffix_len);
+        used += suffix_len;
+    }
+    if (install) {
+        if (used && new_data[used - 1] != '\n')
+            new_data[used++] = '\n';
+        memcpy(new_data + used, hook, (size_t)hook_len);
+        used += (size_t)hook_len;
+    }
+    if (begin_rc_write(&mount_info) < 0)
+        goto out;
+    write_rc = replace_rc_file(new_data, used, &st);
+    write_errno = errno;
+    restore_rc = finish_rc_write(&mount_info);
+    if (restore_rc < 0) {
+        write_rc = -1;
+    } else {
+        errno = write_errno;
+    }
+
+out:
+    free(new_data);
+    free(old_data);
+    return write_rc;
+}
+
 static int install_autostart_payload(int *payload_kind) {
     char source[PATH_MAX];
     int source_kind;
@@ -930,48 +1343,7 @@ static int install_autostart_payload(int *payload_kind) {
     return 0;
 }
 
-static int write_wonder_startup_script(int port) {
-    char script[4096];
-
-    snprintf(script, sizeof(script),
-        "#!/bin/sh\n"
-        "# generated by alice-pusher-bot-wonder\n"
-        "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n"
-        "trap '' HUP\n"
-        "mount -o remount,exec /tmp 2>/dev/null || true\n"
-        "RUN='%s'\n"
-        "LOG='%s'\n"
-        "trim_log() {\n"
-        "    [ -f \"$1\" ] || return 0\n"
-        "    size=$(wc -c < \"$1\" 2>/dev/null || echo 0)\n"
-        "    [ \"$size\" -le 1024 ] && return 0\n"
-        "    tmp=\"$1.trim\"\n"
-        "    tail -c 1024 \"$1\" > \"$tmp\" 2>/dev/null || { rm -f \"$tmp\"; return 0; }\n"
-        "    cat \"$tmp\" > \"$1\" 2>/dev/null || true\n"
-        "    rm -f \"$tmp\"\n"
-        "}\n"
-        "trim_log \"$LOG\"\n"
-        "if ! mkdir /tmp/alice_pusher_wonder_started 2>/dev/null; then\n"
-        "    exit 0\n"
-        "fi\n"
-        "if [ -r \"$RUN\" ]; then\n"
-        "    echo \"event=starting mode=wonder port=%d\" >> \"$LOG\"\n"
-        "    ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh \"$RUN\" -w -L %d >> \"$LOG\" 2>&1 &\n"
-        "    echo \"event=started pid=$!\" >> \"$LOG\"\n"
-        "    trim_log \"$LOG\"\n"
-        "else\n"
-        "    echo \"event=missing_payload path=$RUN\" >> \"$LOG\"\n"
-        "fi\n"
-        "exit 0\n",
-        PUSHER_RUN_PATH, PUSHER_START_LOG, port, port);
-    if (write_text_file(WONDER_PUSHER_SCRIPT, script, 0755) < 0) {
-        set_autostart_error("写入 Wonder 启动项失败：errno=%d。", errno);
-        return -1;
-    }
-    return 0;
-}
-
-static int write_standalone_path_sh(int port) {
+static int write_nv_path_sh_script(int port) {
     char script[4096];
 
     snprintf(script, sizeof(script),
@@ -1004,7 +1376,7 @@ static int write_standalone_path_sh(int port) {
         ". /sbin/global.sh\n"
         "path_sh=/sbin\n"
         "%s\n",
-        PUSHER_AUTOSTART_BEGIN, PUSHER_PATH_SH_MARKER,
+        PUSHER_AUTOSTART_BEGIN, PUSHER_START_MARKER,
         PUSHER_RUN_PATH, PUSHER_BIN_PATH, port, PUSHER_START_LOG,
         port, PUSHER_START_LOG, PUSHER_START_LOG,
         PUSHER_AUTOSTART_END);
@@ -1012,23 +1384,38 @@ static int write_standalone_path_sh(int port) {
         set_autostart_error("写入 Pushbot path_sh wrapper 失败：errno=%d。", errno);
         return -1;
     }
-    if (system("nv set path_sh=" PUSHER_DIR " >/tmp/alice_pusher_nv.out 2>&1 && "
-               "nv save >>/tmp/alice_pusher_nv.out 2>&1") != 0) {
-        set_autostart_error("保存 Pushbot path_sh 入口失败。 ");
-        return -1;
-    }
     return 0;
+}
+
+static int install_nv_entry(int port) {
+    char previous_path[256];
+    int have_previous;
+    int saved_errno;
+
+    if (!nv_binary_path()) return -1;
+    have_previous = read_nv_path_sh(previous_path, sizeof(previous_path)) == 0;
+    if (write_nv_path_sh_script(port) < 0)
+        return -1;
+    if (have_previous && strcmp(previous_path, PUSHER_DIR) == 0)
+        return 0;
+    if (set_nv_path_sh(PUSHER_DIR) == 0)
+        return 0;
+    saved_errno = errno;
+    if (have_previous && strcmp(previous_path, PUSHER_DIR) != 0)
+        set_nv_path_sh(previous_path);
+    errno = saved_errno;
+    return -1;
 }
 
 static int write_pusher_manifest(int mode, int payload_kind, int port) {
     char manifest[1024];
 
     snprintf(manifest, sizeof(manifest),
-             "name=alice-pusher-bot\nversion=2\nmode=%s\n"
+             "name=alice-pusher-bot\nversion=4\nmode=%s\n"
              "payload=%s\nstartup=%s\nport=%d\n",
-             mode == PERSIST_WONDER ? "wonder" : "standalone",
+             mode == PERSIST_NV ? "nv" : "rc",
              payload_kind == 1 ? PUSHER_RUN_PATH : PUSHER_BIN_PATH,
-             mode == PERSIST_WONDER ? WONDER_PUSHER_SCRIPT : PUSHER_GLOBAL_PATH,
+             mode == PERSIST_NV ? PUSHER_GLOBAL_PATH : PUSHER_RC_PATH,
              port);
     if (write_text_file(PUSHER_MANIFEST_PATH, manifest, 0644) < 0) {
         set_autostart_error("写入 Pushbot manifest 失败：errno=%d。", errno);
@@ -1041,19 +1428,20 @@ static void get_autostart_status(autostart_status_t *st) {
     char source[PATH_MAX];
     unsigned long source_size = 0;
     int source_kind;
+    int nv_script;
+    int nv_entry;
+    int rc_entry;
 
     memset(st, 0, sizeof(*st));
-    st->wonder_detected = wonder_deployed();
-    st->mode = persistence_mode();
+    nv_script = nv_script_ready();
+    nv_entry = nv_entry_ready();
+    rc_entry = rc_hook_ready();
+    st->mode = nv_entry ? PERSIST_NV : rc_entry ? PERSIST_RC : PERSIST_NONE;
     st->payload_ready = access(PUSHER_RUN_PATH, R_OK) == 0 ||
                         access(PUSHER_BIN_PATH, X_OK) == 0;
-    st->script_ready = st->mode == PERSIST_WONDER ?
-        path_is_regular_readable(WONDER_PUSHER_SCRIPT) &&
-        file_contains(WONDER_PUSHER_SCRIPT, "generated by alice-pusher-bot-wonder") :
-        st->mode == PERSIST_STANDALONE ? standalone_entry_ready() : 0;
-    st->entry_ready = st->mode == PERSIST_WONDER ?
-        st->wonder_detected && path_is_regular_readable(WONDER_SYSTEM_STARTUP) :
-        st->mode == PERSIST_STANDALONE ? standalone_entry_ready() : 0;
+    st->script_ready = st->mode == PERSIST_NV ? nv_script :
+                       st->mode == PERSIST_RC ? rc_entry : nv_script;
+    st->entry_ready = st->mode != PERSIST_NONE;
     st->installed = st->payload_ready && st->script_ready && st->entry_ready;
     st->startup_running = getenv("ALICE_PUSHER_AUTOSTART") &&
                           strcmp(getenv("ALICE_PUSHER_AUTOSTART"), "1") == 0;
@@ -1067,8 +1455,9 @@ static void get_autostart_status(autostart_status_t *st) {
         safe_copy(st->payload_path, sizeof(st->payload_path), "-");
     }
     safe_copy(st->script_path, sizeof(st->script_path),
-              st->mode == PERSIST_WONDER ? WONDER_PUSHER_SCRIPT :
-              st->mode == PERSIST_STANDALONE ? PUSHER_GLOBAL_PATH : "-");
+              st->mode == PERSIST_NV ? PUSHER_GLOBAL_PATH :
+              st->mode == PERSIST_RC ? PUSHER_RC_PATH :
+              nv_script ? PUSHER_GLOBAL_PATH : "-");
     source_kind = choose_payload_source(source, sizeof(source));
     if (source_kind) source_size = file_size_or_zero(source);
     st->required_bytes = source_size + PERSIST_RESERVE_BYTES;
@@ -1076,46 +1465,88 @@ static void get_autostart_status(autostart_status_t *st) {
     safe_copy(st->error, sizeof(st->error), g_autostart_error);
 }
 
+static int unlink_optional(const char *path) {
+    if (unlink(path) == 0 || errno == ENOENT)
+        return 0;
+    return -1;
+}
+
 static int disable_autostart(void) {
     int rc = 0;
+    int file_errno = 0;
     char path_sh[256];
 
+    g_autostart_error[0] = 0;
     remount_userdata_rw();
-    if (unlink(WONDER_PUSHER_SCRIPT) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(PUSHER_GLOBAL_PATH) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(PUSHER_RUN_PATH) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(PUSHER_BIN_PATH) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(PUSHER_MANIFEST_PATH) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(LEGACY_RUN_PATH) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(LEGACY_BIN_PATH) < 0 && errno != ENOENT) rc = -1;
-    if (unlink(LEGACY_AUTOSTART_SCRIPT) < 0 && errno != ENOENT) rc = -1;
-    if (read_nv_path_sh(path_sh, sizeof(path_sh)) == 0 &&
-        strcmp(path_sh, PUSHER_DIR) == 0 &&
-        system("nv set path_sh=/sbin >/tmp/alice_pusher_nv.out 2>&1 && "
-               "nv save >>/tmp/alice_pusher_nv.out 2>&1") != 0)
-        rc = -1;
+    if (read_nv_path_sh(path_sh, sizeof(path_sh)) == 0) {
+        if (strcmp(path_sh, PUSHER_DIR) == 0 && set_nv_path_sh("/sbin") < 0) {
+            set_autostart_error("无法恢复 NV path_sh，已保留 Pusher wrapper 防止启动链断裂。 ");
+            return -1;
+        }
+    } else if (nv_script_ready()) {
+        set_autostart_error("无法读取 NV path_sh，已保留可能仍在使用的 Pusher wrapper。 ");
+        return -1;
+    }
+    if (rewrite_rc_hook(0, 0) < 0) {
+        set_autostart_error("无法移除 /etc/rc 中的 Pusher 启动块：errno=%d。", errno);
+        return -1;
+    }
+    if (unlink_optional(LEGACY_INTEGRATED_STARTUP) < 0) file_errno = errno;
+    if (unlink_optional(PUSHER_GLOBAL_PATH) < 0 && !file_errno) file_errno = errno;
+    if (unlink_optional(PUSHER_RUN_PATH) < 0 && !file_errno) file_errno = errno;
+    if (unlink_optional(PUSHER_BIN_PATH) < 0 && !file_errno) file_errno = errno;
+    if (unlink_optional(PUSHER_MANIFEST_PATH) < 0 && !file_errno) file_errno = errno;
+    if (unlink_optional(LEGACY_RUN_PATH) < 0 && !file_errno) file_errno = errno;
+    if (unlink_optional(LEGACY_BIN_PATH) < 0 && !file_errno) file_errno = errno;
+    if (unlink_optional(LEGACY_AUTOSTART_SCRIPT) < 0 && !file_errno) file_errno = errno;
     sync();
+    if (file_errno) {
+        rc = -1;
+        set_autostart_error("删除 Pusher 持久化文件失败：errno=%d。", file_errno);
+        errno = file_errno;
+    }
     return rc;
 }
 
 static int install_persistent_autostart(const web_config_t *cfg) {
-    int mode = wonder_deployed() ? PERSIST_WONDER : PERSIST_STANDALONE;
     int payload_kind = 0;
     int port = cfg && cfg->port > 0 ? cfg->port : DEFAULT_WEBUI_PORT;
+    int mode;
+    int nv_errno;
+    int rc_errno;
+    int cleanup_errno = 0;
 
     g_autostart_error[0] = 0;
     if (install_autostart_payload(&payload_kind) < 0)
         return -1;
-    if (mode == PERSIST_WONDER) {
-        if (write_wonder_startup_script(port) < 0)
-            return -1;
-    } else if (write_standalone_path_sh(port) < 0) {
+    if (unlink(LEGACY_INTEGRATED_STARTUP) < 0 && errno != ENOENT) {
+        set_autostart_error("清理旧版 Pushbot 集成启动项失败：errno=%d。", errno);
         return -1;
     }
+    if (install_nv_entry(port) == 0) {
+        mode = PERSIST_NV;
+        if (rc_hook_ready() && rewrite_rc_hook(0, 0) < 0)
+            cleanup_errno = errno;
+    } else {
+        nv_errno = errno ? errno : EIO;
+        if (rewrite_rc_hook(1, port) < 0) {
+            rc_errno = errno ? errno : EIO;
+            set_autostart_error(
+                "NV path_sh 不可用（errno=%d），/etc/rc 回退也失败（errno=%d）。",
+                nv_errno, rc_errno);
+            errno = rc_errno;
+            return -1;
+        }
+        mode = PERSIST_RC;
+    }
+    g_autostart_error[0] = 0;
     if (write_pusher_manifest(mode, payload_kind, port) < 0)
         return -1;
+    if (cleanup_errno)
+        set_autostart_error("NV 自启动已安装，但旧 /etc/rc 启动块清理失败：errno=%d。",
+                            cleanup_errno);
     sync();
-    return 0;
+    return mode;
 }
 
 static void load_web_config(web_config_t *cfg) {
@@ -2059,7 +2490,7 @@ static void render_home(int fd, const char *message) {
         auto_detail = ast.error[0] ? ast.error : "payload 或启动项不完整";
     } else {
         auto_label = "未启用";
-        auto_detail = "点击安装会根据 Wonder 部署状态选择启动模式";
+        auto_detail = "安装时优先使用 NV path_sh，不可用时回退到 /etc/rc";
     }
     html_escape(esc_auto_mode, sizeof(esc_auto_mode), ast.mode_label);
     html_escape(esc_auto_payload, sizeof(esc_auto_payload), auto_payload);
@@ -2092,7 +2523,6 @@ static void render_home(int fd, const char *message) {
         "<div class=\"kv\"><div class=\"k\">状态</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">说明</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">持久化模式</div><div class=\"v\">%s</div></div>"
-        "<div class=\"kv\"><div class=\"k\">Wonder 检测</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">Payload</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">启动项脚本</div><div class=\"v\">%s</div></div>"
         "<div class=\"kv\"><div class=\"k\">脚本状态</div><div class=\"v\">%s</div></div>"
@@ -2100,12 +2530,11 @@ static void render_home(int fd, const char *message) {
         "</div><div class=\"actions\">"
         "<form method=\"post\" action=\"/autostart_on\"><button type=\"submit\"%s>安装自启动</button></form>"
         "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\"%s>卸载自启动</button></form>"
-        "</div><div class=\"hint\">当前入口只使用 userdata；不会修改 rootfs 或 /etc/rc。</div></div></section>",
+        "</div><div class=\"hint\">优先使用 NV path_sh；仅在 NV 不可用时尝试临时重挂 /etc/rc 所在分区并写入启动块。</div></div></section>",
         spid > 0 ? "运行中" : "未运行", (long)spid, (long)strpid,
         esc_target_label, esc_target_path, target_pid > 0 ? target_pid : 0,
         esc_platform, esc_delivery, esc_num,
         auto_label, auto_detail, esc_auto_mode,
-        ast.wonder_detected ? "已部署" : "未部署",
         esc_auto_payload, esc_auto_script,
         ast.script_ready && ast.entry_ready ? "可正常启动" : "未就绪",
         esc_auto_error,
@@ -2656,7 +3085,7 @@ static void render_status_json(int fd) {
         "\"webhook_configured\":%s,\"email_configured\":%s,\"platform\":\"%s\","
         "\"num\":\"%s\",\"port\":%d,\"long_sms_reassembly\":%s,"
         "\"concat_max_segments\":%d,\"concat_max_bytes\":%d,\"concat_timeout_seconds\":%d,"
-        "\"wonder_detected\":%s,\"persistence_mode\":\"%s\","
+        "\"persistence_mode\":\"%s\","
         "\"payload_ready\":%s,\"payload_path\":\"%s\","
         "\"startup_script_ready\":%s,\"startup_entry_ready\":%s,"
         "\"startup_installed\":%s,\"startup_running\":%s,"
@@ -2672,7 +3101,7 @@ static void render_status_json(int fd) {
         platform, num, g_webui_port, cfg.long_sms_reassembly ? "true" : "false",
         ALICE_ENGINE_CONCAT_MAX_PARTS, ALICE_ENGINE_SMS_MAX_BYTES,
         ALICE_ENGINE_CONCAT_TIMEOUT_SECONDS,
-        ast.wonder_detected ? "true" : "false", auto_mode,
+        auto_mode,
         ast.payload_ready ? "true" : "false", auto_payload,
         ast.script_ready ? "true" : "false", ast.entry_ready ? "true" : "false",
         ast.installed ? "true" : "false", ast.startup_running ? "true" : "false",
@@ -3319,9 +3748,11 @@ static void handle_set_port(int fd, const char *body) {
 
 static void handle_autostart_on(int fd) {
     web_config_t cfg;
+    int mode;
 
     load_web_config(&cfg);
-    if (install_persistent_autostart(&cfg) < 0) {
+    mode = install_persistent_autostart(&cfg);
+    if (mode < 0) {
         ring_log_append("[WEBUI] autostart install failed errno=%d detail=%s",
                         errno, g_autostart_error);
         if (g_autostart_error[0]) {
@@ -3334,17 +3765,23 @@ static void handle_autostart_on(int fd) {
         return;
     }
     ring_log_append("[WEBUI] persistent autostart installed mode=%s",
-                    wonder_deployed() ? "wonder" : "standalone");
-    render_home(fd, wonder_deployed() ?
-                "已复用 Alice Wonder 启动链路，Pushbot 自启动项已安装。" :
-                "Pushbot 独立 path_sh 自启动已安装。");
+                    mode == PERSIST_NV ? "nv" : "rc");
+    render_home(fd, mode == PERSIST_NV ?
+                "Pushbot NV path_sh 自启动已安装。" :
+                "NV 不可用，已通过 /etc/rc 回退安装自启动。");
 }
 
 static void handle_autostart_off(int fd) {
     if (disable_autostart() < 0) {
         ring_log_append("[WEBUI] persistent autostart uninstall failed errno=%d",
                         errno);
-        render_home(fd, "卸载失败，请检查 userdata 持久分区和运行日志。");
+        if (g_autostart_error[0]) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "卸载失败：%s", g_autostart_error);
+            render_home(fd, msg);
+        } else {
+            render_home(fd, "卸载失败，请检查持久化入口和运行日志。");
+        }
         return;
     }
     ring_log_append("[WEBUI] persistent autostart uninstalled");

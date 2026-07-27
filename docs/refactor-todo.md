@@ -38,11 +38,13 @@
   - `alice-pusher-bot --mode=send_once ...`
 - 保持现有配置文件格式兼容：`/mnt/userdata/etc_rw/alice_pusher.conf`。
 - 不改变输出二进制名称。
-- 持久化入口优先复用 Alice Wonder 的用户态 `path_sh`：
-  - Wonder 已部署时，Pushbot 启动项写入 `alice_rescue/autostart/alice-pusher-bot.sh`。
-  - Wonder 未部署时，Pushbot 使用自己的 userdata `path_sh` wrapper。
-  - 不修改 rootfs、`/etc/rc` 或 MTD。
-- 安装前检查 userdata 空间；空间不足时拒绝安装，不自动删除 Wonder 文件。
+- 持久化入口使用 NV 优先、`/etc/rc` 回退策略：
+  - payload 和 NV wrapper 固定保存在 `/mnt/userdata/alice_pusher/`。
+  - NV 可用时将 `path_sh` 指向 `/mnt/userdata/alice_pusher`，wrapper 最后继续加载原厂 `/sbin/global.sh`。
+  - NV 不可用或写入校验失败时，识别 `/etc/rc` 所在挂载点，临时重挂为可写并原子安装带标记的启动块，完成后恢复原挂载状态。
+  - NV 和 `/etc/rc` 两种方式都不可用时直接失败；不检测、不依赖或复用 Alice Wonder，也不直接写 MTD。
+  - 升级时只清理历史版本由 Pushbot 自己写入的 `alice_rescue/autostart/alice-pusher-bot.sh`。
+- 安装前检查 userdata 空间；空间不足时拒绝安装。
 
 ## 测试项
 
@@ -55,7 +57,7 @@
 - [x] TLS 仅启用 TLS 1.2、ECDHE-RSA/RSA 与 AES-128-GCM/CBC 最小 cipher suite，关闭 CA、主机名和有效期校验。
 - [x] 本地测试覆盖普通 Webhook、Bark V2、SMTP STARTTLS、SMTP 隐式 TLS，以及 RSA/ECDHE-RSA 和 GCM/CBC 套件。
 - [x] WebUI 的启动、停止、重启、测试发送路径都调用引擎 API。
-- [x] 自启动安装/卸载复用 Wonder 用户态入口，并提供 Wonder 检测、模式、脚本和运行状态。
+- [x] 自启动安装优先使用 NV `path_sh`，不可用时回退 `/etc/rc`，并提供对应模式、payload、脚本和运行状态。
 - [x] Pushbot 持久化安装空间不足时显示明确的需要空间与可用空间。
 
 > 说明：主程序动态依赖私有 TLS 库以及设备的 `libc.so.0`、`libpthread.so.0`、`libgcc_s.so.1`；`.run` 携带私有 TLS 库和短信采集 helper。

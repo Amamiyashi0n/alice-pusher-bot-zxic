@@ -8,6 +8,12 @@ HOST_CC=${HOST_CC:-cc}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
+mkdir -p "$ROOT/.build"
+python3 "$ROOT/tools/embed_asset.py" "$ROOT/pic/miku_compressed.jpg" \
+	"$ROOT/.build/avatar_asset.h" avatar_image image/jpeg
+python3 "$ROOT/tools/embed_asset.py" "$ROOT/pic/sponsor_clean.jpg" \
+	"$ROOT/.build/sponsor_asset.h" sponsor_image image/jpeg
+
 . "$BEARSSL_PROFILE"
 set --
 for source in $BEARSSL_PUSHER_SOURCES; do
@@ -24,3 +30,10 @@ done
 	-L"$TMP" -Wl,-l:libbearssl.so.0 -pthread -o "$TMP/test-pdu"
 LD_LIBRARY_PATH="$TMP${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$TMP/test-pdu"
 "$ROOT/tests/test_tls.sh"
+"$HOST_CC" -std=gnu99 -O1 -g -Wall -Wextra \
+	-Wno-unused-function -Wno-unused-variable \
+	-Wno-unused-result -Wno-format-truncation \
+	-ffunction-sections -fdata-sections -I"$ROOT/src" \
+	"$ROOT/tests/test_autostart.c" -Wl,--gc-sections -pthread \
+	-o "$TMP/test-autostart"
+"$TMP/test-autostart"
