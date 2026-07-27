@@ -49,6 +49,14 @@ run_server_case()
 		"$TMP/test-tls" webhook \
 			"https://127.0.0.1:$port/hook?case=bearssl"
 		;;
+	bark)
+		"$TMP/test-tls" bark \
+			"https://127.0.0.1:$port/test-device-key"
+		;;
+	bark-error)
+		"$TMP/test-tls" bark-error \
+			"https://127.0.0.1:$port/test-device-key"
+		;;
 	starttls|tls)
 		"$TMP/test-tls" smtp 127.0.0.1 "$port" "$client_mode"
 		;;
@@ -63,19 +71,29 @@ run_server_case()
 }
 
 . "$BEARSSL_PROFILE"
-set -- "$ROOT/tests/test_tls_paths.c" "$ROOT/src/bearssl_transport.c"
+set --
 for source in $BEARSSL_PUSHER_SOURCES; do
 	set -- "$@" "$BEARSSL_DIR/$source"
 done
+"$HOST_CC" -std=gnu99 -O1 -g -Wall -Wextra -fPIC -shared \
+	-I"$BEARSSL_DIR/inc" -I"$BEARSSL_DIR/src" "$@" \
+	-Wl,-soname,libbearssl.so.0 \
+	-Wl,--version-script="$ROOT/tools/bearssl_exports.map" \
+	-o "$TMP/libbearssl.so.0"
 "$HOST_CC" -std=gnu99 -O1 -g -Wall -Wextra \
-	-I"$ROOT/src" -I"$BEARSSL_DIR/inc" -I"$BEARSSL_DIR/src" \
-	"$@" -pthread -o "$TMP/test-tls"
+	-I"$ROOT/src" -I"$BEARSSL_DIR/inc" \
+	"$ROOT/tests/test_tls_paths.c" "$ROOT/src/bearssl_transport.c" \
+	-L"$TMP" -Wl,-l:libbearssl.so.0 -pthread -o "$TMP/test-tls"
+LD_LIBRARY_PATH="$TMP${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 	-subj /CN=localhost -keyout "$TMP/server.key" -out "$TMP/server.crt" \
 	>/dev/null 2>&1
 
 run_server_case webhook AES128-GCM-SHA256 webhook
+run_server_case bark ECDHE-RSA-AES128-GCM-SHA256 bark
+run_server_case bark-error ECDHE-RSA-AES128-GCM-SHA256 bark-error
 run_server_case webhook AES128-SHA256 webhook
 run_server_case webhook AES128-SHA webhook
 run_server_case smtp-starttls AES128-GCM-SHA256 starttls

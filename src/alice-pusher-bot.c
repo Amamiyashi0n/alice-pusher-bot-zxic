@@ -1549,6 +1549,21 @@ static int extract_bark_device_key(const char *url, char *out, size_t outsz) {
     return 0;
 }
 
+static int parse_http_status(const unsigned char *response, size_t length) {
+    const unsigned char *space;
+
+    if (!response || length < 12 || memcmp(response, "HTTP/", 5) != 0)
+        return -1;
+    space = (const unsigned char *)memchr(response, ' ', length);
+    if (!space || (size_t)(response + length - space) < 4 ||
+        space[1] < '0' || space[1] > '9' ||
+        space[2] < '0' || space[2] > '9' ||
+        space[3] < '0' || space[3] > '9')
+        return -1;
+    return (space[1] - '0') * 100 + (space[2] - '0') * 10 +
+           (space[3] - '0');
+}
+
 int alice_engine_build_webhook_payload(const char *webhook, const char *platform,
                                  const char *txt,
                                  const char *custom_ctype,
@@ -1636,7 +1651,9 @@ static int post_https_body(const char *webhook, const char *ctype,
     char *request_buffer = NULL;
     unsigned char read_buf[1024];
     int request_len;
+    int status;
     size_t request_cap;
+    size_t response_len = 0;
     int ret;
     int rc = -1;
     alice_transport_t transport;
@@ -1694,11 +1711,28 @@ static int post_https_body(const char *webhook, const char *ctype,
     }
 
     memset(read_buf, 0, sizeof(read_buf));
-    ret = alice_transport_read(&transport, read_buf, sizeof(read_buf) - 1);
-    if (ret > 0)
+    do {
+        ret = alice_transport_read(&transport, read_buf + response_len,
+                                   sizeof(read_buf) - 1 - response_len);
+        if (ret > 0)
+            response_len += (size_t)ret;
+    } while (ret > 0 && response_len < sizeof(read_buf) - 1 &&
+             !memchr(read_buf, '\n', response_len));
+    if (response_len > 0) {
+        read_buf[response_len] = 0;
         engine_log("[WEBHOOK] response: %s", read_buf);
-    else if (ret < 0 && alice_transport_tls_error(&transport) != 0)
-        print_tls_error(&transport, "webhook read");
+        status = parse_http_status(read_buf, response_len);
+        if (status < 200 || status > 299) {
+            engine_log("[WEBHOOK] HTTP request failed status=%d", status);
+            goto cleanup_tls;
+        }
+    } else {
+        if (ret < 0 && alice_transport_tls_error(&transport) != 0)
+            print_tls_error(&transport, "webhook read");
+        else
+            engine_log("[WEBHOOK] empty HTTP response");
+        goto cleanup_tls;
+    }
     rc = 0;
 
 cleanup_tls:

@@ -135,10 +135,36 @@ static void test_gsm7_concat(void) {
     assert(strcmp(info.text, "HELLO") == 0);
 }
 
+static void test_bark_webhook(void) {
+    char payload[1024];
+    char ctype[128];
+
+    assert(strcmp(alice_engine_normalize_platform("bark"), "bark") == 0);
+    assert(strcmp(alice_engine_detect_platform_from_url(
+                      "https://api.day.app/device-key"), "bark") == 0);
+    assert(alice_engine_build_webhook_payload(
+               "https://api.day.app/device-key?group=sms", "bark",
+               "line 1\n\"line 2\"", NULL, NULL,
+               payload, sizeof(payload), ctype, sizeof(ctype)) == 0);
+    assert(strcmp(ctype, "application/json;charset=utf-8") == 0);
+    assert(strcmp(payload,
+                  "{\"title\":\"Alice Pusher\",\"body\":\"line 1\\n\\\"line 2\\\"\","
+                  "\"device_key\":\"device-key\"}") == 0);
+    assert(alice_engine_build_webhook_payload(
+               "https://api.day.app/push", "bark", "test", NULL, NULL,
+               payload, sizeof(payload), ctype, sizeof(ctype)) < 0);
+    assert(parse_http_status((const unsigned char *)"HTTP/1.1 204 No Content\r\n",
+                             25) == 204);
+    assert(parse_http_status((const unsigned char *)"HTTP/1.1 400 Bad Request\r\n",
+                             26) == 400);
+    assert(parse_http_status((const unsigned char *)"not HTTP", 8) < 0);
+}
+
 int main(void) {
     test_ucs2_concat(0xaa, 1);
     test_ucs2_concat(0x1234, 2);
     test_gsm7_concat();
+    test_bark_webhook();
     puts("pdu tests: ok");
     return 0;
 }

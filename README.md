@@ -51,8 +51,8 @@
    SDK_CC=/path/to/arm-buildroot-linux-uclibcgnueabi-gcc sh ./make.sh
    ```
 
-3. 编译成功后生成主程序 `output/alice-pusher-bot`、私有动态库
-   `output/lib/libalice-bearssl.so.0` 和自解压的
+3. 编译成功后生成主程序 `output/alice-pusher-bot`、独立 BearSSL 动态库
+   `output/lib/libbearssl.so.0` 和自解压的
    `output/alice-pusher-bot.run`。直接运行裸主程序时需要指定库目录：
    ```bash
    LD_LIBRARY_PATH=output/lib output/alice-pusher-bot
@@ -66,7 +66,7 @@
 - `src/alice-pusher-bot.c`：PDU 解码、strace 跟踪、Webhook 和 SMTP 邮箱推送引擎核心。
 - `src/bearssl_transport.c`：Webhook 与 SMTP 共用的 TCP/BearSSL 传输层。
 - `src/alice-pusher-bot.h`：WebUI 调用引擎核心的公共接口。
-- `third_party/bearssl`：构建私有 TLS 动态库的 BearSSL 0.6 最小源码子集。
+- `third_party/bearssl`：构建独立 `libbearssl.so.0` 的 BearSSL 0.6 最小源码子集。
 - `tests/test_pdu.c`：不连接网络的 PDU 解码与长短信拼合测试。
 - `tests/run_tests.sh`：PDU、HTTPS、SMTP STARTTLS 和隐式 TLS 测试入口。
 
@@ -75,9 +75,9 @@
 ## 注意事项
 
 - 请确保您的系统环境满足依赖要求。
-- `.run` 会携带私有的 `libalice-bearssl.so.0` 和面向目标 ARMv7/uClibc 环境的轻量 `sms-ptrace`。启动器自动设置动态库目录；目标系统只需提供已有的 `libc.so.0`、`libpthread.so.0` 和 `libgcc_s.so.1`。
+- `.run` 会携带独立的 `libbearssl.so.0` 和面向目标 ARMv7/uClibc 环境的轻量 `sms-ptrace`。启动器自动设置动态库目录；目标系统只需提供已有的 `libc.so.0`、`libpthread.so.0` 和 `libgcc_s.so.1`。TCP、Webhook 和 SMTP 传输代码保留在主程序中，BearSSL 库本身不包含业务接口。
 - WebUI 支持最多 4 个推送目标；Webhook 和 SMTP 邮箱均可作为独立目标同时启用，每个目标使用独立的平台、地址和模板配置。邮箱支持明文、STARTTLS 和隐式 TLS。
-- HTTPS/SMTP TLS 使用 BearSSL，固定为 TLS 1.2、RSA 密钥交换和 AES-128-GCM/CBC。为保持原有行为，当前不校验证书链、主机名和有效期，连接可能受到中间人攻击。
+- HTTPS/SMTP TLS 使用 BearSSL，固定为 TLS 1.2，支持 ECDHE-RSA 与 RSA 密钥交换以及 AES-128-GCM/CBC；Bark 可直接使用 `https://api.day.app/DEVICE_KEY`。为保持原有行为，当前不校验证书链、主机名和有效期，连接可能受到中间人攻击。
 - WebUI 的“实验功能”页面默认启用长短信分段拼合，支持 UCS2、GSM 7-bit，以及 8 位和 16 位 UDH 引用号。分段支持乱序和重复到达，收齐后只推送一次。
 - 长短信拼合限制为最多 16 段、拼合后最多 4096 字节，缓存超时时间为 120 秒。超时、超限或不支持的编码只记录并丢弃，不发送不完整短信；关闭开关后恢复每个 PDU 独立推送。
 - 配置文件中的 `long_sms_reassembly=1` 或 `0` 控制该功能。通过 WebUI 保存时，如果短信监控服务正在运行，会自动重启服务使设置立即生效。

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import socket
 import ssl
@@ -54,6 +55,51 @@ def serve_webhook(connection, context, port, expected_host):
     assert body[:content_length] == b'{"test":"bearssl"}'
     connection.sendall(
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+    )
+    connection.close()
+
+
+def serve_bark(connection, context, port, expected_host, success):
+    connection = context.wrap_socket(connection, server_side=True)
+    request = bytearray()
+    while b"\r\n\r\n" not in request:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise RuntimeError("incomplete HTTP headers")
+        request += chunk
+    headers, body = bytes(request).split(b"\r\n\r\n", 1)
+    lines = headers.split(b"\r\n")
+    header_values = {}
+    for line in lines[1:]:
+        name, value = line.split(b":", 1)
+        header_values[name.lower()] = value.strip()
+    content_length = int(header_values[b"content-length"])
+    while len(body) < content_length:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise RuntimeError("incomplete HTTP body")
+        body += chunk
+    payload = json.loads(body[:content_length])
+    assert lines[0] == b"POST /push HTTP/1.1"
+    assert header_values[b"host"] == f"{expected_host}:{port}".encode()
+    assert header_values[b"content-type"] == b"application/json;charset=utf-8"
+    assert payload == {
+        "title": "Alice Pusher",
+        "body": 'bearssl bark\n"quoted"',
+        "device_key": "test-device-key",
+    }
+    if success:
+        status = b"200 OK"
+        response = b'{"code":200,"message":"success"}'
+    else:
+        status = b"400 Bad Request"
+        response = b'{"code":400,"message":"invalid device key"}'
+    connection.sendall(b"HTTP/1.1 ")
+    connection.sendall(
+        status + b"\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(response)}\r\n".encode()
+        + b"Connection: close\r\n\r\n"
+        + response
     )
     connection.close()
 
@@ -126,6 +172,10 @@ def main():
     listener.close()
     if mode == "webhook":
         serve_webhook(connection, context, port, expected_host)
+    elif mode == "bark":
+        serve_bark(connection, context, port, expected_host, True)
+    elif mode == "bark-error":
+        serve_bark(connection, context, port, expected_host, False)
     elif mode == "smtp-starttls":
         serve_smtp(connection, context, False)
     elif mode == "smtp-tls":

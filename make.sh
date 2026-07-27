@@ -29,7 +29,7 @@ WEBUI_OBJECT="$BUILD_DIR/webui.o"
 ENGINE_OBJECT="$BUILD_DIR/alice-pusher-bot.o"
 TRANSPORT_OBJECT="$BUILD_DIR/bearssl-transport.o"
 RUNTIME_DIR="$OUTPUT_DIR/lib"
-TLS_LIBRARY_NAME="libalice-bearssl.so.0"
+TLS_LIBRARY_NAME="libbearssl.so.0"
 TLS_LIBRARY_BUILD="$BUILD_DIR/$TLS_LIBRARY_NAME"
 TLS_LIBRARY="$RUNTIME_DIR/$TLS_LIBRARY_NAME"
 TLS_EXPORT_MAP="$ROOT_DIR/tools/bearssl_exports.map"
@@ -73,6 +73,7 @@ build_trace_helper() {
 	find "$RUNTIME_DIR" -maxdepth 1 -type f -name strace -delete
 	find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'libmbed*.so*' -delete
 	find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'libalice-bearssl.so*' -delete
+	find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'libbearssl.so*' -delete
 }
 
 need_exec "$CC"
@@ -126,7 +127,7 @@ build_trace_helper
 "$CC" $ENGINE_CFLAGS -I"$ROOT_DIR/src" -I"$BEARSSL_DIR/inc" \
 	-c "$ENGINE_SRC" -o "$ENGINE_OBJECT"
 "$CC" $ENGINE_CFLAGS -I"$ROOT_DIR/src" -I"$BEARSSL_DIR/inc" \
-	-fPIC -c "$TRANSPORT_SRC" -o "$TRANSPORT_OBJECT"
+	-c "$TRANSPORT_SRC" -o "$TRANSPORT_OBJECT"
 
 BEARSSL_OBJECTS=""
 for source in $BEARSSL_PUSHER_SOURCES; do
@@ -137,7 +138,7 @@ for source in $BEARSSL_PUSHER_SOURCES; do
 	BEARSSL_OBJECTS="$BEARSSL_OBJECTS $object"
 done
 
-"$CC" -shared "$TRANSPORT_OBJECT" $BEARSSL_OBJECTS \
+"$CC" -shared $BEARSSL_OBJECTS \
 	-o "$TLS_LIBRARY_BUILD" $LDFLAGS $DYNAMIC_LIBGCC_FLAGS \
 	-Wl,-soname,"$TLS_LIBRARY_NAME" \
 	-Wl,--version-script="$TLS_EXPORT_MAP"
@@ -145,7 +146,7 @@ done
 cp -Lf "$TLS_LIBRARY_BUILD" "$TLS_LIBRARY"
 chmod 755 "$TLS_LIBRARY"
 
-"$CC" "$WEBUI_OBJECT" "$ENGINE_OBJECT" -o "$TARGET" \
+"$CC" "$WEBUI_OBJECT" "$ENGINE_OBJECT" "$TRANSPORT_OBJECT" -o "$TARGET" \
 	$PROGRAM_LDFLAGS -pthread -L"$RUNTIME_DIR" \
 	-Wl,-rpath-link,"$RUNTIME_DIR" -Wl,-l:"$TLS_LIBRARY_NAME"
 "$STRIP" --strip-all "$TARGET"
@@ -177,8 +178,13 @@ if readelf -d "$TARGET" "$TLS_LIBRARY" 2>/dev/null | grep -E 'libmbed(tls|x509|c
 	echo "错误：产物包含禁止的 mbedTLS/glibc 运行时依赖。" >&2
 	exit 1
 fi
-if readelf --wide --dyn-syms "$TLS_LIBRARY" 2>/dev/null | grep -E '[[:space:]]br_[A-Za-z0-9_]*$' >/dev/null; then
-	echo "错误：BearSSL 内部符号被意外导出。" >&2
+if readelf --wide --dyn-syms "$TLS_LIBRARY" 2>/dev/null | grep -E '[[:space:]]alice_transport_[A-Za-z0-9_]*$' >/dev/null; then
+	echo "错误：独立 BearSSL 库中混入了业务传输接口。" >&2
+	exit 1
+fi
+if ! readelf --wide --dyn-syms "$TLS_LIBRARY" 2>/dev/null | grep -E '[[:space:]]br_ssl_client_reset$' >/dev/null ||
+	! readelf --wide --dyn-syms "$TLS_LIBRARY" 2>/dev/null | grep -E '[[:space:]]br_x509_decoder_init$' >/dev/null; then
+	echo "错误：独立 BearSSL 库没有导出所需公共接口。" >&2
 	exit 1
 fi
 "$SELF_EXTRACT" "$TARGET" "$TARGET_RUN" "$RUNTIME_DIR"

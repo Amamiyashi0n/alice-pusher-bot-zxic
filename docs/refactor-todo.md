@@ -50,10 +50,10 @@
 - [x] 链接阶段无重复符号，重点检查 `main`、`send_webhook_msg`、`decode_pdu`、`signal_handler`。
 - [x] `output/alice-pusher-bot` 无参数时显示 usage。
 - [x] `output/alice-pusher-bot --mode=send_once` 缺参数时显示 usage。
-- [x] Webhook 与 SMTP 共用私有的 `libalice-bearssl.so.0`，BearSSL 内部符号不对外导出。
+- [x] Webhook 与 SMTP 共用独立的 `libbearssl.so.0`，业务传输层保留在主程序中，未使用的 BearSSL 内部符号不对外导出。
 - [x] `.run` 自带并提取私有 TLS 动态库，裸二进制通过 `LD_LIBRARY_PATH=output/lib` 运行。
-- [x] TLS 仅启用 TLS 1.2、RSA/AES-128-GCM/CBC 最小 cipher suite，关闭 CA、主机名和有效期校验。
-- [x] 本地测试覆盖 Webhook、SMTP STARTTLS、SMTP 隐式 TLS 及 GCM/CBC 套件。
+- [x] TLS 仅启用 TLS 1.2、ECDHE-RSA/RSA 与 AES-128-GCM/CBC 最小 cipher suite，关闭 CA、主机名和有效期校验。
+- [x] 本地测试覆盖普通 Webhook、Bark V2、SMTP STARTTLS、SMTP 隐式 TLS，以及 RSA/ECDHE-RSA 和 GCM/CBC 套件。
 - [x] WebUI 的启动、停止、重启、测试发送路径都调用引擎 API。
 - [x] 自启动安装/卸载复用 Wonder 用户态入口，并提供 Wonder 检测、模式、脚本和运行状态。
 - [x] Pushbot 持久化安装空间不足时显示明确的需要空间与可用空间。

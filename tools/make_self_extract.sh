@@ -23,7 +23,7 @@ trace_helper_enabled=0
 if [ -n "$runtime_dir" ] && [ -x "$runtime_dir/sms-ptrace" ]; then
 	trace_helper_enabled=1
 fi
-tls_library_name=libalice-bearssl.so.0
+tls_library_name=libbearssl.so.0
 tls_runtime_enabled=0
 if [ -n "$runtime_dir" ] && [ -f "$runtime_dir/$tls_library_name" ]; then
 	tls_runtime_enabled=1
@@ -53,9 +53,9 @@ src, dst, runtime_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
     zf.write(src, "alice-pusher-bot")
     if runtime_dir:
-        tls_library = os.path.join(runtime_dir, "libalice-bearssl.so.0")
+        tls_library = os.path.join(runtime_dir, "libbearssl.so.0")
         if os.path.isfile(tls_library):
-            zf.write(tls_library, "lib/libalice-bearssl.so.0")
+            zf.write(tls_library, "lib/libbearssl.so.0")
         helper = os.path.join(runtime_dir, "sms-ptrace")
         if os.path.isfile(helper):
             zf.write(helper, "sms-ptrace")
@@ -105,7 +105,7 @@ rm -f "$trace_helper_tmp"
 runtime_ready()
 {
 	if [ "$tls_runtime_enabled" = 1 ] &&
-	   [ ! -f "$lib_out/$tls_library_name" ]; then
+	   [ ! -s "$lib_out/$tls_library_name" ]; then
 		return 1
 	fi
 	if [ "$trace_helper_enabled" = 1 ]; then

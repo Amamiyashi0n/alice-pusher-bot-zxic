@@ -1,13 +1,29 @@
 {
     global:
-        alice_transport_init;
-        alice_transport_connect;
-        alice_transport_start_tls;
-        alice_transport_write_all;
-        alice_transport_read;
-        alice_transport_tls_error;
-        alice_transport_is_tls;
-        alice_transport_close;
+        br_aes_small_cbcdec_vtable;
+        br_aes_small_cbcenc_vtable;
+        br_aes_small_ctr_vtable;
+        br_ec_prime_i31;
+        br_ghash_ctmul;
+        br_rsa_i31_pkcs1_vrfy;
+        br_rsa_i31_public;
+        br_sha1_vtable;
+        br_sha256_vtable;
+        br_ssl_client_reset;
+        br_ssl_client_zero;
+        br_ssl_engine_set_buffer;
+        br_ssl_engine_set_suites;
+        br_sslio_flush;
+        br_sslio_init;
+        br_sslio_read;
+        br_sslio_write_all;
+        br_sslrec_in_cbc_vtable;
+        br_sslrec_in_gcm_vtable;
+        br_sslrec_out_cbc_vtable;
+        br_sslrec_out_gcm_vtable;
+        br_tls12_sha256_prf;
+        br_x509_decoder_init;
+        br_x509_decoder_push;
     local:
         *;
 };

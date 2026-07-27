@@ -68,7 +68,7 @@ static const br_x509_pkey *x509_get_pkey(
     const br_x509_class *const *context, unsigned *usages) {
     insecure_x509_context *x509 = (insecure_x509_context *)(void *)context;
     if (usages)
-        *usages = BR_KEYTYPE_KEYX;
+        *usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
     return br_x509_decoder_get_pkey(&x509->decoder);
 }
 
@@ -159,6 +159,7 @@ int alice_transport_connect(alice_transport_t *transport, const char *host,
 int alice_transport_start_tls(alice_transport_t *transport,
                               const char *server_name) {
     static const uint16_t suites[] = {
+        BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         BR_TLS_RSA_WITH_AES_128_GCM_SHA256,
         BR_TLS_RSA_WITH_AES_128_CBC_SHA256,
         BR_TLS_RSA_WITH_AES_128_CBC_SHA
@@ -183,6 +184,9 @@ int alice_transport_start_tls(alice_transport_t *transport,
                            &br_sha256_vtable);
     br_ssl_engine_set_prf_sha256(&state->ssl.eng, &br_tls12_sha256_prf);
     br_ssl_client_set_rsapub(&state->ssl, &br_rsa_i31_public);
+    br_ssl_engine_set_rsavrfy(&state->ssl.eng,
+                              &br_rsa_i31_pkcs1_vrfy);
+    br_ssl_engine_set_ec(&state->ssl.eng, &br_ec_prime_i31);
     br_ssl_engine_set_cbc(&state->ssl.eng,
                           &br_sslrec_in_cbc_vtable,
                           &br_sslrec_out_cbc_vtable);

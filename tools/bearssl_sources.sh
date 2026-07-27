@@ -8,6 +8,10 @@ src/codec/enc16be.c
 src/codec/enc32be.c
 src/codec/enc32le.c
 src/codec/enc64be.c
+src/ec/ec_prime_i31.c
+src/ec/ec_secp256r1.c
+src/ec/ec_secp384r1.c
+src/ec/ec_secp521r1.c
 src/hash/ghash_ctmul.c
 src/hash/multihash.c
 src/hash/sha1.c
@@ -18,6 +22,8 @@ src/int/i31_decmod.c
 src/int/i31_decode.c
 src/int/i31_encode.c
 src/int/i31_fmont.c
+src/int/i31_iszero.c
+src/int/i31_modpow.c
 src/int/i31_modpow2.c
 src/int/i31_montmul.c
 src/int/i31_muladd.c
@@ -29,7 +35,9 @@ src/mac/hmac.c
 src/mac/hmac_ct.c
 src/rand/hmac_drbg.c
 src/rand/sysrng.c
+src/rsa/rsa_i31_pkcs1_vrfy.c
 src/rsa/rsa_i31_pub.c
+src/rsa/rsa_pkcs1_sig_unpad.c
 src/ssl/prf.c
 src/ssl/prf_sha256.c
 src/ssl/ssl_client.c
