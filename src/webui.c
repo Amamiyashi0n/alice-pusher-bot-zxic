@@ -34,6 +34,8 @@
 #define PUSHER_MANIFEST_PATH PUSHER_DIR "/manifest"
 #define PUSHER_START_LOG "/tmp/alice_pusher_autostart.out"
 #define PUSHER_START_MARKER "/tmp/alice_pusher_autostart.started"
+#define PUSHER_AUTOSTART_ENV "ALICE_PUSHER_AUTOSTART"
+#define PUSHER_NO_AUTO_INSTALL_ENV "ALICE_PUSHER_NO_AUTO_INSTALL"
 #define PUSHER_AUTOSTART_BEGIN "# alice-pusher-bot path_sh begin"
 #define PUSHER_AUTOSTART_END "# alice-pusher-bot path_sh end"
 #ifndef PUSHER_RC_PATH
@@ -1443,8 +1445,8 @@ static void get_autostart_status(autostart_status_t *st) {
                        st->mode == PERSIST_RC ? rc_entry : nv_script;
     st->entry_ready = st->mode != PERSIST_NONE;
     st->installed = st->payload_ready && st->script_ready && st->entry_ready;
-    st->startup_running = getenv("ALICE_PUSHER_AUTOSTART") &&
-                          strcmp(getenv("ALICE_PUSHER_AUTOSTART"), "1") == 0;
+    st->startup_running = getenv(PUSHER_AUTOSTART_ENV) &&
+                          strcmp(getenv(PUSHER_AUTOSTART_ENV), "1") == 0;
     safe_copy(st->mode_label, sizeof(st->mode_label),
               persistence_mode_label(st->mode));
     if (st->payload_ready) {
@@ -2490,7 +2492,8 @@ static void render_home(int fd, const char *message) {
         auto_detail = ast.error[0] ? ast.error : "payload 或启动项不完整";
     } else {
         auto_label = "未启用";
-        auto_detail = "安装时优先使用 NV path_sh，不可用时回退到 /etc/rc";
+        auto_detail = ast.error[0] ? ast.error :
+                      "手动运行 Pusher 时会自动安装持久化入口";
     }
     html_escape(esc_auto_mode, sizeof(esc_auto_mode), ast.mode_label);
     html_escape(esc_auto_payload, sizeof(esc_auto_payload), auto_payload);
@@ -2530,7 +2533,7 @@ static void render_home(int fd, const char *message) {
         "</div><div class=\"actions\">"
         "<form method=\"post\" action=\"/autostart_on\"><button type=\"submit\"%s>安装自启动</button></form>"
         "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\"%s>卸载自启动</button></form>"
-        "</div><div class=\"hint\">优先使用 NV path_sh；仅在 NV 不可用时尝试临时重挂 /etc/rc 所在分区并写入启动块。</div></div></section>",
+        "</div><div class=\"hint\">手动运行即自动安装或升级；自启动拉起时不会重复写入。可在此卸载，当前 WebUI 会话不会自动重装。</div></div></section>",
         spid > 0 ? "运行中" : "未运行", (long)spid, (long)strpid,
         esc_target_label, esc_target_path, target_pid > 0 ? target_pid : 0,
         esc_platform, esc_delivery, esc_num,
@@ -3705,6 +3708,7 @@ static void handle_save_experimental(int fd, const char *self_path,
 
 static void handle_set_port(int fd, const char *body) {
     web_config_t cfg;
+    autostart_status_t ast;
     char value[32];
     char response[1024];
     int port;
@@ -3720,6 +3724,18 @@ static void handle_set_port(int fd, const char *body) {
     if (save_web_config(&cfg) < 0) {
         ring_log_append("[WEBUI] port save failed port=%d errno=%d", port, errno);
         render_config(fd, "端口保存失败，请检查 /mnt/userdata 是否可写。");
+        return;
+    }
+    get_autostart_status(&ast);
+    if (ast.installed && install_persistent_autostart(&cfg) < 0) {
+        char message[384];
+
+        ring_log_append("[WEBUI] port saved but autostart refresh failed port=%d errno=%d detail=%s",
+                        port, errno, g_autostart_error);
+        snprintf(message, sizeof(message),
+                 "端口已保存，但自启动入口更新失败：%s",
+                 g_autostart_error[0] ? g_autostart_error : "请查看运行日志。");
+        render_config(fd, message);
         return;
     }
     if (port == g_webui_port) {
@@ -3766,6 +3782,7 @@ static void handle_autostart_on(int fd) {
     }
     ring_log_append("[WEBUI] persistent autostart installed mode=%s",
                     mode == PERSIST_NV ? "nv" : "rc");
+    unsetenv(PUSHER_NO_AUTO_INSTALL_ENV);
     render_home(fd, mode == PERSIST_NV ?
                 "Pushbot NV path_sh 自启动已安装。" :
                 "NV 不可用，已通过 /etc/rc 回退安装自启动。");
@@ -3784,6 +3801,9 @@ static void handle_autostart_off(int fd) {
         }
         return;
     }
+    if (setenv(PUSHER_NO_AUTO_INSTALL_ENV, "1", 1) < 0)
+        ring_log_append("[WEBUI] failed to suppress session auto-install errno=%d",
+                        errno);
     ring_log_append("[WEBUI] persistent autostart uninstalled");
     render_home(fd, "Pushbot 持久化自启动已卸载。");
 }
@@ -4040,6 +4060,47 @@ static void handle_http_client(int fd, const char *self_path) {
     http_send(fd, 405, "Method Not Allowed", "text/plain", "method not allowed\n");
 }
 
+static int environment_flag_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && strcmp(value, "1") == 0;
+}
+
+static int webui_auto_install_needed(int suppressed, int launched_by_autostart,
+                                     int already_installed) {
+    return !suppressed && (!launched_by_autostart || !already_installed);
+}
+
+static void maybe_auto_install_webui(int port) {
+    autostart_status_t ast;
+    web_config_t cfg;
+    int launched_by_autostart;
+    int suppressed;
+    int mode;
+
+    launched_by_autostart = environment_flag_enabled(PUSHER_AUTOSTART_ENV);
+    suppressed = environment_flag_enabled(PUSHER_NO_AUTO_INSTALL_ENV);
+    get_autostart_status(&ast);
+    if (!webui_auto_install_needed(suppressed, launched_by_autostart,
+                                   ast.installed)) {
+        ring_log_append("[WEBUI] automatic persistence install skipped source=%s suppressed=%d",
+                        launched_by_autostart ? "autostart" : "manual",
+                        suppressed);
+        return;
+    }
+    load_web_config(&cfg);
+    cfg.port = port;
+    mode = install_persistent_autostart(&cfg);
+    if (mode < 0) {
+        ring_log_append("[WEBUI] automatic persistence install failed errno=%d detail=%s",
+                        errno, g_autostart_error);
+        fprintf(stderr, "Alice Pusher automatic install failed: %s\n",
+                g_autostart_error[0] ? g_autostart_error : "unknown error");
+        return;
+    }
+    ring_log_append("[WEBUI] automatic persistence install completed mode=%s",
+                    mode == PERSIST_NV ? "nv" : "rc");
+}
+
 static int run_webui(const char *self_path, int port) {
     int sfd;
     int yes = 1;
@@ -4074,6 +4135,7 @@ static int run_webui(const char *self_path, int port) {
         close(sfd);
         return 1;
     }
+    maybe_auto_install_webui(port);
     ring_log_append("[WEBUI] listening on 0.0.0.0:%d", port);
     printf("Alice Pusher WebUI listening on 0.0.0.0:%d\n", port);
     fflush(stdout);
@@ -4099,7 +4161,7 @@ static int run_webui(const char *self_path, int port) {
 int main(int argc, char *argv[]) {
     int only_service_mode = 0;
     int only_send_once_mode = 0;
-    int webui_mode = 0;
+    int webui_mode = argc == 1;
     int webui_port = DEFAULT_WEBUI_PORT;
     web_config_t saved_cfg;
     char *manual_msisdn = NULL;

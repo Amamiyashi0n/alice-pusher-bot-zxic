@@ -58,6 +58,12 @@
    LD_LIBRARY_PATH=output/lib output/alice-pusher-bot
    ```
 
+   在目标设备上直接运行 `.run` 即会启动 WebUI，并自动安装或升级持久化入口：
+   ```bash
+   /bin/sh ./alice-pusher-bot.run
+   ```
+   由持久化入口开机拉起时会跳过重复安装；需要移除时在 WebUI 中点击“卸载自启动”。
+
 ---
 
 ## 源码结构
@@ -77,6 +83,7 @@
 - 请确保您的系统环境满足依赖要求。
 - `.run` 会携带独立的 `libbearssl.so.0` 和面向目标 ARMv7/uClibc 环境的轻量 `sms-ptrace`。启动器自动设置动态库目录；目标系统只需提供已有的 `libc.so.0`、`libpthread.so.0` 和 `libgcc_s.so.1`。TCP、Webhook 和 SMTP 传输代码保留在主程序中，BearSSL 库本身不包含业务接口。
 - Pusher 持久化自启动优先通过 NV `path_sh` 加载 `/mnt/userdata/alice_pusher/global.sh`；NV 工具或写入校验不可用时，才尝试将 `/etc/rc` 所在分区临时重挂为可写并安装带标记的启动块。两种入口都不可用时安装直接失败，不写 MTD，也不依赖 Alice Wonder。
+- 手动启动 WebUI 会自动执行持久化安装或升级；由持久化入口启动时不会重复写入。WebUI 卸载后，本次运行会话内的端口切换或 WebUI 重启不会自动重装，下一次手动运行安装包时才会再次安装。
 - WebUI 支持最多 4 个推送目标；Webhook 和 SMTP 邮箱均可作为独立目标同时启用，每个目标使用独立的平台、地址和模板配置。邮箱支持明文、STARTTLS 和隐式 TLS。
 - HTTPS/SMTP TLS 使用 BearSSL，固定为 TLS 1.2，支持 ECDHE-RSA 与 RSA 密钥交换以及 AES-128-GCM/CBC；Bark 可直接使用 `https://api.day.app/DEVICE_KEY`。为保持原有行为，当前不校验证书链、主机名和有效期，连接可能受到中间人攻击。
 - WebUI 的“实验功能”页面默认启用长短信分段拼合，支持 UCS2、GSM 7-bit，以及 8 位和 16 位 UDH 引用号。分段支持乱序和重复到达，收齐后只推送一次。

@@ -73,6 +73,13 @@ int main(void) {
     assert(strcmp(path_sh, PUSHER_DIR) == 0);
     assert(set_nv_path_sh("/sbin") == 0);
 
+    assert(webui_auto_install_needed(0, 0, 0) == 1);
+    assert(webui_auto_install_needed(0, 0, 1) == 1);
+    assert(webui_auto_install_needed(0, 1, 0) == 1);
+    assert(webui_auto_install_needed(0, 1, 1) == 0);
+    assert(webui_auto_install_needed(1, 0, 0) == 0);
+    assert(webui_auto_install_needed(1, 1, 0) == 0);
+
     test_write_path(PROC_MOUNTS_PATH, root_mounts, 0600);
     assert(find_rc_mount(&mount_info) == 0);
     assert(strcmp(mount_info.source, "/dev/root") == 0);

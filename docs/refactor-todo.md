@@ -32,6 +32,7 @@
 ## 兼容要求
 
 - 保持现有命令兼容：
+  - `alice-pusher-bot`（默认启动 WebUI 并自动安装或升级持久化入口）
   - `alice-pusher-bot -w`
   - `alice-pusher-bot --webui`
   - `alice-pusher-bot --mode=service_start ...`
@@ -50,7 +51,7 @@
 
 - [x] `sh ./make.sh` 成功生成 `output/alice-pusher-bot` 和 `output/alice-pusher-bot.run`。
 - [x] 链接阶段无重复符号，重点检查 `main`、`send_webhook_msg`、`decode_pdu`、`signal_handler`。
-- [x] `output/alice-pusher-bot` 无参数时显示 usage。
+- [x] `output/alice-pusher-bot` 无参数时启动 WebUI，并自动安装或升级持久化入口。
 - [x] `output/alice-pusher-bot --mode=send_once` 缺参数时显示 usage。
 - [x] Webhook 与 SMTP 共用独立的 `libbearssl.so.0`，业务传输层保留在主程序中，未使用的 BearSSL 内部符号不对外导出。
 - [x] `.run` 自带并提取私有 TLS 动态库，裸二进制通过 `LD_LIBRARY_PATH=output/lib` 运行。
@@ -58,6 +59,7 @@
 - [x] 本地测试覆盖普通 Webhook、Bark V2、SMTP STARTTLS、SMTP 隐式 TLS，以及 RSA/ECDHE-RSA 和 GCM/CBC 套件。
 - [x] WebUI 的启动、停止、重启、测试发送路径都调用引擎 API。
 - [x] 自启动安装优先使用 NV `path_sh`，不可用时回退 `/etc/rc`，并提供对应模式、payload、脚本和运行状态。
+- [x] 持久化入口拉起 WebUI 时跳过重复安装；WebUI 卸载后当前会话重启不会自动重装。
 - [x] Pushbot 持久化安装空间不足时显示明确的需要空间与可用空间。
 
 > 说明：主程序动态依赖私有 TLS 库以及设备的 `libc.so.0`、`libpthread.so.0`、`libgcc_s.so.1`；`.run` 携带私有 TLS 库和短信采集 helper。
