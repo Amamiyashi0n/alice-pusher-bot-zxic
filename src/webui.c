@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -66,11 +67,13 @@
 #define TARGET_UFI_PATH ALICE_TARGET_UFI_PATH
 
 static int g_webui_port = DEFAULT_WEBUI_PORT;
+static int g_webui_start_service;
 static volatile sig_atomic_t g_webui_restart_requested;
 static int g_webui_restart_port;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int run_webui(const char *self_path, int port);
+static void ring_log_append(const char *fmt, ...);
 static void json_escape(char *out, size_t outsz, const char *in);
 static void safe_copy(char *dst, size_t dstsz, const char *src);
 static void config_escape(char *out, size_t outsz, const char *in);
@@ -126,6 +129,7 @@ typedef struct {
     int entry_ready;
     int installed;
     int startup_running;
+    int userdata_space_ok;
     int mode;
     unsigned long free_bytes;
     unsigned long required_bytes;
@@ -945,6 +949,14 @@ static int userdata_free_bytes(unsigned long *out) {
     return 0;
 }
 
+static int userdata_space_sufficient(unsigned long free_bytes,
+                                     unsigned long existing_size,
+                                     unsigned long required) {
+    if (free_bytes >= required)
+        return 1;
+    return existing_size >= required - free_bytes;
+}
+
 static int choose_payload_source(char *out, size_t outsz) {
     const char *run_src = getenv("ALICE_PUSHER_RUN_SOURCE");
 
@@ -981,7 +993,7 @@ static int payload_space_ok(const char *source, unsigned long *free_out,
     required = source_size + PERSIST_RESERVE_BYTES;
     if (free_out) *free_out = free_bytes;
     if (required_out) *required_out = required;
-    if (free_bytes + existing_size < required) {
+    if (!userdata_space_sufficient(free_bytes, existing_size, required)) {
         set_autostart_error("userdata 空间不足：需要约 %lu KB，可用约 %lu KB。",
                             (required + 1023UL) / 1024UL,
                             (free_bytes + 1023UL) / 1024UL);
@@ -1205,9 +1217,9 @@ static int rewrite_rc_hook(int install, int port) {
         "%s\n"
         "if mkdir '%s' 2>/dev/null; then\n"
         "    if [ -r '%s' ]; then\n"
-        "        ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh '%s' -w -L %d >> '%s' 2>&1 &\n"
+        "        ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh '%s' -w --start-service -L %d >> '%s' 2>&1 &\n"
         "    elif [ -x '%s' ]; then\n"
-        "        ALICE_PUSHER_AUTOSTART=1 '%s' -w -L %d >> '%s' 2>&1 &\n"
+        "        ALICE_PUSHER_AUTOSTART=1 '%s' -w --start-service -L %d >> '%s' 2>&1 &\n"
         "    else\n"
         "        rmdir '%s' 2>/dev/null || true\n"
         "    fi\n"
@@ -1367,9 +1379,9 @@ static int write_nv_path_sh_script(int port) {
         "    RUN='%s'\n"
         "    BIN='%s'\n"
         "    if [ -r \"$RUN\" ]; then\n"
-        "        ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh \"$RUN\" -w -L %d >> '%s' 2>&1 &\n"
+        "        ALICE_PUSHER_AUTOSTART=1 ALICE_PUSHER_EXTRACT=/tmp/alice-pusher-bot /bin/sh \"$RUN\" -w --start-service -L %d >> '%s' 2>&1 &\n"
         "    elif [ -x \"$BIN\" ]; then\n"
-        "        ALICE_PUSHER_AUTOSTART=1 \"$BIN\" -w -L %d >> '%s' 2>&1 &\n"
+        "        ALICE_PUSHER_AUTOSTART=1 \"$BIN\" -w --start-service -L %d >> '%s' 2>&1 &\n"
         "    else\n"
         "        echo \"missing alice-pusher-bot payload\" >> '%s'\n"
         "    fi\n"
@@ -1429,12 +1441,15 @@ static int write_pusher_manifest(int mode, int payload_kind, int port) {
 static void get_autostart_status(autostart_status_t *st) {
     char source[PATH_MAX];
     unsigned long source_size = 0;
+    unsigned long existing_size;
     int source_kind;
+    int free_rc;
     int nv_script;
     int nv_entry;
     int rc_entry;
 
     memset(st, 0, sizeof(*st));
+    st->userdata_space_ok = 1;
     nv_script = nv_script_ready();
     nv_entry = nv_entry_ready();
     rc_entry = rc_hook_ready();
@@ -1463,8 +1478,19 @@ static void get_autostart_status(autostart_status_t *st) {
     source_kind = choose_payload_source(source, sizeof(source));
     if (source_kind) source_size = file_size_or_zero(source);
     st->required_bytes = source_size + PERSIST_RESERVE_BYTES;
-    userdata_free_bytes(&st->free_bytes);
-    safe_copy(st->error, sizeof(st->error), g_autostart_error);
+    free_rc = userdata_free_bytes(&st->free_bytes);
+    existing_size = file_size_or_zero(PUSHER_RUN_PATH);
+    if (source_size && free_rc == 0 &&
+        !userdata_space_sufficient(st->free_bytes, existing_size,
+                                   st->required_bytes)) {
+        st->userdata_space_ok = 0;
+        snprintf(st->error, sizeof(st->error),
+                 "userdata 空间不足：需要约 %lu KB，可用约 %lu KB。",
+                 (st->required_bytes + 1023UL) / 1024UL,
+                 (st->free_bytes + 1023UL) / 1024UL);
+    } else {
+        safe_copy(st->error, sizeof(st->error), g_autostart_error);
+    }
 }
 
 static int unlink_optional(const char *path) {
@@ -1935,7 +1961,11 @@ static void restart_webui_process(const char *self_path, int port) {
 
         snprintf(port_arg, sizeof(port_arg), "%d", port);
         usleep(200000);
-        execl(self, self, "-w", "-L", port_arg, (char *)NULL);
+        if (g_webui_start_service)
+            execl(self, self, "-w", "--start-service", "-L", port_arg,
+                  (char *)NULL);
+        else
+            execl(self, self, "-w", "-L", port_arg, (char *)NULL);
         _exit(127);
     }
 }
@@ -1963,6 +1993,179 @@ static int process_alive(pid_t pid) {
     if (pid <= 0) return 0;
     if (kill(pid, 0) == 0) return 1;
     return errno == EPERM;
+}
+
+static int proc_name_is_pid(const char *name) {
+    const unsigned char *p = (const unsigned char *)name;
+
+    if (!p || !*p)
+        return 0;
+    while (*p) {
+        if (!isdigit(*p))
+            return 0;
+        p++;
+    }
+    return 1;
+}
+
+static int find_tcp_socket_inode(const char *table_path, int port,
+                                 unsigned long *inode_out) {
+    FILE *fp;
+    char line[512];
+
+    if (!table_path || !inode_out)
+        return 0;
+    fp = fopen(table_path, "r");
+    if (!fp)
+        return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *fields[16];
+        char *saveptr = NULL;
+        char *field;
+        char *colon;
+        char *end;
+        unsigned long local_port;
+        unsigned long inode;
+        size_t field_count = 0;
+
+        field = strtok_r(line, " \t\r\n", &saveptr);
+        while (field && field_count < sizeof(fields) / sizeof(fields[0])) {
+            fields[field_count++] = field;
+            field = strtok_r(NULL, " \t\r\n", &saveptr);
+        }
+        if (field_count < 10 || strcmp(fields[3], "0A") != 0)
+            continue;
+        colon = strrchr(fields[1], ':');
+        if (!colon)
+            continue;
+        errno = 0;
+        local_port = strtoul(colon + 1, &end, 16);
+        if (errno || !end || *end || local_port != (unsigned long)port)
+            continue;
+        errno = 0;
+        inode = strtoul(fields[9], &end, 10);
+        if (errno || !end || *end || inode == 0)
+            continue;
+        *inode_out = inode;
+        fclose(fp);
+        return 1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int find_webui_socket_inode(int port, unsigned long *inode_out) {
+    if (find_tcp_socket_inode("/proc/net/tcp", port, inode_out))
+        return 1;
+    return find_tcp_socket_inode("/proc/net/tcp6", port, inode_out);
+}
+
+/* Map the listener inode from /proc/net/tcp* back to the owning process. */
+static pid_t find_socket_owner(unsigned long inode) {
+    DIR *proc_dir;
+    struct dirent *proc_entry;
+    char fd_dir_path[PATH_MAX];
+
+    proc_dir = opendir("/proc");
+    if (!proc_dir)
+        return 0;
+    while ((proc_entry = readdir(proc_dir)) != NULL) {
+        DIR *fd_dir;
+        struct dirent *fd_entry;
+        long pid_value;
+
+        if (!proc_name_is_pid(proc_entry->d_name))
+            continue;
+        pid_value = strtol(proc_entry->d_name, NULL, 10);
+        if (pid_value <= 0)
+            continue;
+        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%s/fd",
+                 proc_entry->d_name);
+        fd_dir = opendir(fd_dir_path);
+        if (!fd_dir)
+            continue;
+        while ((fd_entry = readdir(fd_dir)) != NULL) {
+            char fd_path[PATH_MAX];
+            char link_target[128];
+            char *end;
+            unsigned long fd_inode;
+            ssize_t link_len;
+
+            if (!proc_name_is_pid(fd_entry->d_name))
+                continue;
+            snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path,
+                     fd_entry->d_name);
+            link_len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+            if (link_len < 0)
+                continue;
+            link_target[link_len] = '\0';
+            if (strncmp(link_target, "socket:[", 8) != 0)
+                continue;
+            errno = 0;
+            fd_inode = strtoul(link_target + 8, &end, 10);
+            if (errno || !end || strcmp(end, "]") != 0 ||
+                fd_inode != inode)
+                continue;
+            closedir(fd_dir);
+            closedir(proc_dir);
+            return (pid_t)pid_value;
+        }
+        closedir(fd_dir);
+    }
+    closedir(proc_dir);
+    return 0;
+}
+
+static int terminate_webui_port_owner(int port) {
+    unsigned long inode = 0;
+    pid_t pid;
+    int i;
+
+    if (!find_webui_socket_inode(port, &inode))
+        return 0;
+    pid = find_socket_owner(inode);
+    if (pid <= 0 || pid == getpid()) {
+        ring_log_append("[WEBUI] port %d is occupied but its owner could not be resolved",
+                        port);
+        return -1;
+    }
+    ring_log_append("[WEBUI] port %d occupied by pid=%ld; terminating it",
+                    port, (long)pid);
+    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
+        return -1;
+    for (i = 0; i < 30; i++) {
+        if (!find_webui_socket_inode(port, &inode) || !process_alive(pid))
+            return 1;
+        usleep(100 * 1000);
+    }
+    if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+        return -1;
+    ring_log_append("[WEBUI] port %d owner pid=%ld required SIGKILL",
+                    port, (long)pid);
+    return 1;
+}
+
+static int bind_webui_socket(int sfd, struct sockaddr_in *addr, int port) {
+    int attempt;
+
+    for (attempt = 0; attempt < 4; attempt++) {
+        int bind_errno;
+
+        if (bind(sfd, (struct sockaddr *)addr, sizeof(*addr)) == 0)
+            return 0;
+        bind_errno = errno;
+        if (bind_errno != EADDRINUSE) {
+            errno = bind_errno;
+            return -1;
+        }
+        if (terminate_webui_port_owner(port) <= 0) {
+            errno = bind_errno;
+            return -1;
+        }
+        usleep(100 * 1000);
+    }
+    errno = EADDRINUSE;
+    return -1;
 }
 
 static pid_t service_pid(void) {
@@ -2487,6 +2690,10 @@ static void render_home(int fd, const char *message) {
     } else if (ast.installed) {
         auto_label = "已安装，等待开机";
         auto_detail = "持久化启动项和 payload 已就绪";
+    } else if (!ast.userdata_space_ok) {
+        auto_label = "设备不支持";
+        auto_detail = ast.error[0] ? ast.error :
+                      "mnt/userdata 可用空间不足，无法安装自启动";
     } else if (ast.script_ready || ast.payload_ready) {
         auto_label = "未完整安装";
         auto_detail = ast.error[0] ? ast.error : "payload 或启动项不完整";
@@ -2541,7 +2748,7 @@ static void render_home(int fd, const char *message) {
         esc_auto_payload, esc_auto_script,
         ast.script_ready && ast.entry_ready ? "可正常启动" : "未就绪",
         esc_auto_error,
-        ast.installed ? " disabled" : "",
+        ast.installed || !ast.userdata_space_ok ? " disabled" : "",
         (ast.payload_ready || ast.script_ready) ? "" : " disabled");
     append_page_end(body, WEB_BODY_MAX);
     http_send(fd, 200, "OK", "text/html; charset=utf-8", body);
@@ -4123,7 +4330,7 @@ static int run_webui(const char *self_path, int port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((unsigned short)port);
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind_webui_socket(sfd, &addr, port) < 0) {
         ring_log_append("[WEBUI] bind failed port=%d errno=%d", port, errno);
         perror("bind");
         close(sfd);
@@ -4136,6 +4343,18 @@ static int run_webui(const char *self_path, int port) {
         return 1;
     }
     maybe_auto_install_webui(port);
+    if (g_webui_start_service) {
+        web_config_t cfg;
+
+        load_web_config(&cfg);
+        if (start_service(self_path, &cfg) < 0) {
+            ring_log_append("[WEBUI] automatic service start failed errno=%d",
+                            errno);
+            fprintf(stderr,
+                    "Alice Pusher automatic service start failed: "
+                    "please configure a valid push target.\n");
+        }
+    }
     ring_log_append("[WEBUI] listening on 0.0.0.0:%d", port);
     printf("Alice Pusher WebUI listening on 0.0.0.0:%d\n", port);
     fflush(stdout);
@@ -4161,6 +4380,7 @@ static int run_webui(const char *self_path, int port) {
 int main(int argc, char *argv[]) {
     int only_service_mode = 0;
     int only_send_once_mode = 0;
+    int start_service_on_webui = 0;
     int webui_mode = argc == 1;
     int webui_port = DEFAULT_WEBUI_PORT;
     web_config_t saved_cfg;
@@ -4184,6 +4404,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--webui") == 0) {
             webui_mode = 1;
         }
+        if (strcmp(argv[i], "--start-service") == 0)
+            start_service_on_webui = 1;
         if (strcmp(argv[i], "-L") == 0 && i + 1 < argc) {
             webui_port = atoi(argv[++i]);
         }
@@ -4232,6 +4454,7 @@ int main(int argc, char *argv[]) {
     }
     if (webui_mode) {
         char self_path[512];
+        g_webui_start_service = start_service_on_webui;
         resolve_self_path(self_path, sizeof(self_path), argv[0]);
         return run_webui(self_path, webui_port);
     }

@@ -59,8 +59,11 @@
 - [x] 本地测试覆盖普通 Webhook、Bark V2、SMTP STARTTLS、SMTP 隐式 TLS，以及 RSA/ECDHE-RSA 和 GCM/CBC 套件。
 - [x] WebUI 的启动、停止、重启、测试发送路径都调用引擎 API。
 - [x] 自启动安装优先使用 NV `path_sh`，不可用时回退 `/etc/rc`，并提供对应模式、payload、脚本和运行状态。
+- [x] 持久化自启动入口同时拉起 WebUI 和短信监控服务，并避免重复启动。
 - [x] 持久化入口拉起 WebUI 时跳过重复安装；WebUI 卸载后当前会话重启不会自动重装。
 - [x] Pushbot 持久化安装空间不足时显示明确的需要空间与可用空间。
+- [x] WebUI 检测到 userdata 空间不足时，将自启动状态显示为“设备不支持”并禁用安装。
+- [x] WebUI 目标端口被占用时，在目标设备侧定位并终止监听进程后重试绑定。
 
 > 说明：主程序动态依赖私有 TLS 库以及设备的 `libc.so.0`、`libpthread.so.0`、`libgcc_s.so.1`；`.run` 携带私有 TLS 库和短信采集 helper。
 
